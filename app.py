@@ -1,48 +1,158 @@
-from dash import Dash, html, dcc, dash_table, Input, Output
+from pathlib import Path
+
 import pandas as pd
+from dash import Dash, Input, Output, dash_table, dcc, html
+
+
+DATA_FILE = Path(__file__).with_name("Fake_Dataset_For_Testing.csv")
+
+# Read the CSV stored beside app.py.
+businesses = pd.read_csv(DATA_FILE, encoding="utf-8-sig")
+businesses.columns = businesses.columns.str.strip()
+businesses = businesses.replace({"(blank)": "", "blank": ""}).fillna("")
+
+required_columns = [
+    "Business Name",
+    "Phone",
+    "Email",
+    "Website",
+    "Address",
+    "Google Maps",
+    "Size",
+    "Industry",
+    "Skills",
+    "Interests",
+    "Wheelchair",
+]
+
+missing_columns = [column for column in required_columns if column not in businesses.columns]
+if missing_columns:
+    raise ValueError(
+        "The CSV is missing these columns: " + ", ".join(missing_columns)
+    )
+
+
+def split_items(value):
+    """Split comma-separated values such as Skills and Interests."""
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def make_options(values):
+    """Create sorted Dash dropdown options from non-empty values."""
+    clean_values = sorted({str(value).strip() for value in values if str(value).strip()})
+    return [{"label": value, "value": value} for value in clean_values]
+
+
+def make_multi_value_options(series):
+    """Create dropdown options from comma-separated cells."""
+    items = set()
+    for value in series:
+        items.update(split_items(value))
+    return make_options(items)
+
+
+def apply_filters(
+    data,
+    search=None,
+    industry=None,
+    size=None,
+    skill=None,
+    interest=None,
+    wheelchair=None,
+    address=None,
+    ignore=None,
+):
+    """
+    Filter the dataset.
+
+    `ignore` is used when generating a dropdown's available options so that
+    the dropdown does not filter its own choices.
+    """
+    filtered = data.copy()
+    ignore = ignore or set()
+
+    if search and "search" not in ignore:
+        filtered = filtered[
+            filtered["Business Name"]
+            .astype(str)
+            .str.contains(search.strip(), case=False, na=False, regex=False)
+        ]
+
+    if industry and "industry" not in ignore:
+        filtered = filtered[filtered["Industry"] == industry]
+
+    if size and "size" not in ignore:
+        filtered = filtered[filtered["Size"] == size]
+
+    if skill and "skill" not in ignore:
+        filtered = filtered[
+            filtered["Skills"]
+            .astype(str)
+            .str.contains(skill, case=False, na=False, regex=False)
+        ]
+
+    if interest and "interest" not in ignore:
+        filtered = filtered[
+            filtered["Interests"]
+            .astype(str)
+            .str.contains(interest, case=False, na=False, regex=False)
+        ]
+
+    if wheelchair and "wheelchair" not in ignore:
+        filtered = filtered[
+            filtered["Wheelchair"].astype(str).str.casefold()
+            == str(wheelchair).casefold()
+        ]
+
+    if address and "address" not in ignore:
+        filtered = filtered[filtered["Address"] == address]
+
+    return filtered
+
 
 app = Dash(__name__)
+app.title = "Keystone Employer Database"
 
-# Temporary sample data
-businesses = pd.DataFrame(
-    [
-        {
-            "Business Name": "Bright Path Services",
-            "Industry": "Community Services",
-            "Location": "Melbourne",
-            "Business Size": "Small",
-            "Skills": "Communication, Administration",
-            "Email": "contact@brightpath.com",
-        },
-        {
-            "Business Name": "TechBridge Australia",
-            "Industry": "Technology",
-            "Location": "Clayton",
-            "Business Size": "Medium",
-            "Skills": "Python, Data Analysis",
-            "Email": "hello@techbridge.com",
-        },
-        {
-            "Business Name": "Green Future Co.",
-            "Industry": "Sustainability",
-            "Location": "Abbotsford",
-            "Business Size": "Large",
-            "Skills": "Research, Reporting",
-            "Email": "info@greenfuture.com",
-        },
-    ]
-)
+# Remove the browser's default white margin and keep the page purple.
+app.index_string = """
+<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>{%title%}</title>
+        {%favicon%}
+        {%css%}
+        <style>
+            html, body, #react-entry-point {
+                margin: 0;
+                min-height: 100%;
+                background: #4200A8;
+            }
+            * {
+                box-sizing: border-box;
+            }
+        </style>
+    </head>
+    <body>
+        {%app_entry%}
+        <footer>
+            {%config%}
+            {%scripts%}
+            {%renderer%}
+        </footer>
+    </body>
+</html>
+"""
 
 app.layout = html.Div(
     style={
-        "backgroundColor": "#4200a8",
+        "backgroundColor": "#4200A8",
         "minHeight": "100vh",
         "fontFamily": "Arial, sans-serif",
-        "padding": "0",
         "margin": "0",
+        "paddingBottom": "70px",
     },
     children=[
-        # Header
         html.Div(
             style={
                 "display": "flex",
@@ -55,25 +165,20 @@ app.layout = html.Div(
                 html.H1(
                     "Keystone Employer Database",
                     style={
-                        "color": "#66f2e3",
+                        "color": "#66F2E3",
                         "margin": "0",
                         "fontSize": "32px",
                     },
                 ),
                 html.Div(
                     "Business Search Dashboard",
-                    style={
-                        "color": "white",
-                        "fontSize": "16px",
-                    },
+                    style={"color": "white", "fontSize": "16px"},
                 ),
             ],
         ),
-
-        # Main content
         html.Div(
             style={
-                "maxWidth": "1250px",
+                "maxWidth": "1500px",
                 "margin": "0 auto",
                 "padding": "45px 30px",
             },
@@ -87,15 +192,13 @@ app.layout = html.Div(
                     },
                 ),
                 html.P(
-                    "Search and filter businesses by industry, location, size and skills.",
+                    "Search by business name and filter the available results.",
                     style={
-                        "color": "#d9ccff",
+                        "color": "#D9CCFF",
                         "fontSize": "18px",
                         "marginBottom": "30px",
                     },
                 ),
-
-                # Filter card
                 html.Div(
                     style={
                         "backgroundColor": "white",
@@ -107,89 +210,66 @@ app.layout = html.Div(
                     children=[
                         html.Label(
                             "Search businesses",
-                            style={
-                                "fontWeight": "bold",
-                                "color": "#2e1654",
-                            },
+                            style={"fontWeight": "bold", "color": "#2E1654"},
                         ),
                         dcc.Input(
                             id="search-input",
                             type="text",
-                            placeholder="Search by business name or skill...",
+                            placeholder="Search by business name...",
+                            debounce=True,
                             style={
                                 "width": "100%",
                                 "padding": "14px",
                                 "marginTop": "8px",
                                 "marginBottom": "20px",
                                 "borderRadius": "10px",
-                                "border": "1px solid #cccccc",
+                                "border": "1px solid #CCCCCC",
                                 "fontSize": "16px",
-                                "boxSizing": "border-box",
                             },
                         ),
-
                         html.Div(
                             style={
                                 "display": "grid",
-                                "gridTemplateColumns": "repeat(4, 1fr)",
+                                "gridTemplateColumns": (
+                                    "repeat(auto-fit, minmax(190px, 1fr))"
+                                ),
                                 "gap": "16px",
                             },
                             children=[
                                 dcc.Dropdown(
                                     id="industry-filter",
-                                    options=[
-                                        {"label": value, "value": value}
-                                        for value in sorted(
-                                            businesses["Industry"].unique()
-                                        )
-                                    ],
                                     placeholder="Industry",
                                     clearable=True,
                                 ),
                                 dcc.Dropdown(
-                                    id="location-filter",
-                                    options=[
-                                        {"label": value, "value": value}
-                                        for value in sorted(
-                                            businesses["Location"].unique()
-                                        )
-                                    ],
-                                    placeholder="Location",
-                                    clearable=True,
-                                ),
-                                dcc.Dropdown(
                                     id="size-filter",
-                                    options=[
-                                        {"label": value, "value": value}
-                                        for value in sorted(
-                                            businesses["Business Size"].unique()
-                                        )
-                                    ],
                                     placeholder="Business size",
                                     clearable=True,
                                 ),
                                 dcc.Dropdown(
                                     id="skills-filter",
-                                    options=[
-                                        {"label": skill, "value": skill}
-                                        for skill in [
-                                            "Administration",
-                                            "Communication",
-                                            "Data Analysis",
-                                            "Python",
-                                            "Reporting",
-                                            "Research",
-                                        ]
-                                    ],
                                     placeholder="Skills",
+                                    clearable=True,
+                                ),
+                                dcc.Dropdown(
+                                    id="interests-filter",
+                                    placeholder="Interests",
+                                    clearable=True,
+                                ),
+                                dcc.Dropdown(
+                                    id="wheelchair-filter",
+                                    placeholder="Wheelchair accessibility",
+                                    clearable=True,
+                                ),
+                                dcc.Dropdown(
+                                    id="address-filter",
+                                    placeholder="Address / location",
                                     clearable=True,
                                 ),
                             ],
                         ),
                     ],
                 ),
-
-                # Results section
                 html.Div(
                     style={
                         "backgroundColor": "white",
@@ -201,33 +281,39 @@ app.layout = html.Div(
                         html.H3(
                             "Business results",
                             style={
-                                "color": "#2e1654",
+                                "color": "#2E1654",
                                 "fontSize": "24px",
                                 "marginTop": "0",
                             },
                         ),
                         html.Div(
                             id="result-count",
-                            style={
-                                "color": "#6f5a8c",
-                                "marginBottom": "15px",
-                            },
+                            style={"color": "#6F5A8C", "marginBottom": "15px"},
                         ),
                         dash_table.DataTable(
                             id="business-table",
                             columns=[
-                                {"name": col, "id": col}
-                                for col in businesses.columns
+                                {
+                                    "name": column,
+                                    "id": column,
+                                    "presentation": (
+                                        "markdown"
+                                        if column in {"Website", "Google Maps"}
+                                        else "input"
+                                    ),
+                                }
+                                for column in businesses.columns
                             ],
-                            data=businesses.to_dict("records"),
                             page_size=10,
+                            sort_action="native",
+                            markdown_options={"link_target": "_blank"},
                             style_table={
                                 "overflowX": "auto",
                                 "borderRadius": "12px",
                             },
                             style_header={
-                                "backgroundColor": "#66f2e3",
-                                "color": "#2e1654",
+                                "backgroundColor": "#66F2E3",
+                                "color": "#2E1654",
                                 "fontWeight": "bold",
                                 "border": "none",
                                 "padding": "12px",
@@ -235,13 +321,16 @@ app.layout = html.Div(
                             style_cell={
                                 "textAlign": "left",
                                 "padding": "12px",
-                                "border": "1px solid #eeeeee",
+                                "border": "1px solid #EEEEEE",
                                 "fontFamily": "Arial, sans-serif",
+                                "minWidth": "125px",
+                                "maxWidth": "270px",
+                                "whiteSpace": "normal",
                             },
                             style_data_conditional=[
                                 {
                                     "if": {"row_index": "odd"},
-                                    "backgroundColor": "#f8f5ff",
+                                    "backgroundColor": "#F8F5FF",
                                 }
                             ],
                         ),
@@ -256,39 +345,80 @@ app.layout = html.Div(
 @app.callback(
     Output("business-table", "data"),
     Output("result-count", "children"),
+    Output("industry-filter", "options"),
+    Output("size-filter", "options"),
+    Output("skills-filter", "options"),
+    Output("interests-filter", "options"),
+    Output("wheelchair-filter", "options"),
+    Output("address-filter", "options"),
     Input("search-input", "value"),
     Input("industry-filter", "value"),
-    Input("location-filter", "value"),
     Input("size-filter", "value"),
     Input("skills-filter", "value"),
+    Input("interests-filter", "value"),
+    Input("wheelchair-filter", "value"),
+    Input("address-filter", "value"),
 )
-def filter_businesses(search, industry, location, size, skill):
-    filtered = businesses.copy()
+def update_dashboard(
+    search,
+    industry,
+    size,
+    skill,
+    interest,
+    wheelchair,
+    address,
+):
+    selected = {
+        "search": search,
+        "industry": industry,
+        "size": size,
+        "skill": skill,
+        "interest": interest,
+        "wheelchair": wheelchair,
+        "address": address,
+    }
 
-    if search:
-        search = search.lower()
-        filtered = filtered[
-            filtered["Business Name"].str.lower().str.contains(search)
-            | filtered["Skills"].str.lower().str.contains(search)
-        ]
+    # Final table: apply every currently selected filter.
+    filtered = apply_filters(businesses, **selected)
 
-    if industry:
-        filtered = filtered[filtered["Industry"] == industry]
+    # Cascading dropdowns: each dropdown is based on all the other filters.
+    industry_data = apply_filters(
+        businesses, **selected, ignore={"industry"}
+    )
+    size_data = apply_filters(
+        businesses, **selected, ignore={"size"}
+    )
+    skill_data = apply_filters(
+        businesses, **selected, ignore={"skill"}
+    )
+    interest_data = apply_filters(
+        businesses, **selected, ignore={"interest"}
+    )
+    wheelchair_data = apply_filters(
+        businesses, **selected, ignore={"wheelchair"}
+    )
+    address_data = apply_filters(
+        businesses, **selected, ignore={"address"}
+    )
 
-    if location:
-        filtered = filtered[filtered["Location"] == location]
+    display_data = filtered.copy()
 
-    if size:
-        filtered = filtered[filtered["Business Size"] == size]
-
-    if skill:
-        filtered = filtered[
-            filtered["Skills"].str.contains(skill, case=False, na=False)
-        ]
+    display_data["Website"] = display_data["Website"].apply(
+        lambda link: f"[Open website]({link})" if str(link).strip() else ""
+    )
+    display_data["Google Maps"] = display_data["Google Maps"].apply(
+        lambda link: f"[Open map]({link})" if str(link).strip() else ""
+    )
 
     return (
-        filtered.to_dict("records"),
-        f"{len(filtered)} businesses found",
+        display_data.to_dict("records"),
+        f"{len(display_data)} businesses found",
+        make_options(industry_data["Industry"]),
+        make_options(size_data["Size"]),
+        make_multi_value_options(skill_data["Skills"]),
+        make_multi_value_options(interest_data["Interests"]),
+        make_options(wheelchair_data["Wheelchair"]),
+        make_options(address_data["Address"]),
     )
 
 

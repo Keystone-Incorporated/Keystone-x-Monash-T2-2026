@@ -1,0 +1,13 @@
+Business Name,Phone,Email,Website,Address,Google Maps,Size,Industry,Skills,Interests,Wheelchair
+TechBridge Australia,(03) 9123 4567,hello@techbridge.com,https://techbridge.com.au,"21 Wellington Rd, Clayton VIC","https://maps.google.com/?q=21+Wellington+Rd,+Clayton+VIC",Medium,Technology,"Python, SQL, Power BI","AI, Data Analytics",Yes
+TechBridge Australia,(03) 9123 4567,hello@techbridge.com,https://techbridge.com.au,"550 Bourke St, Melbourne VIC","https://maps.google.com/?q=550+Bourke+St,+Melbourne+VIC",Medium,Technology,"Python, SQL, Power BI","AI, Data Analytics",Yes
+Green Future Co.,(03) 9011 8822,info@greenfuture.com.au,https://greenfuture.com.au,"18 Johnston St, Abbotsford VIC","https://maps.google.com/?q=18+Johnston+St,+Abbotsford+VIC",Large,Sustainability,"Research, Reporting",Environment,Yes
+Bright Path Services,(03) 9876 2222,contact@brightpath.org,https://brightpath.org.au,"88 Collins St, Melbourne VIC","https://maps.google.com/?q=88+Collins+St,+Melbourne+VIC",Small,Community Services,"Communication, Administration",Disability Support,Yes
+Pixel Creative Studio,(03) 9345 1122,hello@pixelcreative.com,https://pixelcreative.com,Fitzroy VIC,https://maps.google.com/?q=Fitzroy+VIC,Small,Marketing,"Graphic Design, Social Media",Design,No
+HealthPlus Clinic,(03) 9765 8877,reception@healthplus.com.au,https://healthplus.com.au,"45 Springvale Rd, Glen Waverley VIC","https://maps.google.com/?q=45+Springvale+Rd,+Glen+Waverley+VIC",Large,Healthcare,Customer Service,Health,Yes
+Cafe Bloom,(03) 9555 4444,(blank),https://cafebloom.com.au,Clayton VIC,https://maps.google.com/?q=Clayton+VIC,Small,Hospitality,Customer Service,Food,No
+Future Robotics,(blank),careers@futurerobotics.com,https://futurerobotics.com,Scoresby VIC,https://maps.google.com/?q=Scoresby+VIC,Medium,Engineering,"Python, Robotics",Automation,Yes
+Local Makers Hub,(03) 9444 1212,info@makershub.au,(blank),Box Hill VIC,https://maps.google.com/?q=Box+Hill+VIC,Small,Manufacturing,"Woodworking, CAD",Crafts,Yes
+Mountain Adventures,(03) 9333 2211,info@mountainadv.com,https://mountainadv.com,Ballarat VIC,,Medium,Tourism,Event Planning,Outdoor Activities,No
+Innovation Works,(03) 9666 8888,info@innovationworks.com,https://innovationworks.com,Richmond VIC,https://maps.google.com/?q=Richmond+VIC,Large,Technology,"Python, Machine Learning",AI,Yes
+Creative Corner,(03) 9777 9999,hello@creativecorner.au,https://creativecorner.au,St Kilda VIC,https://maps.google.com/?q=St+Kilda+VIC,Small,Marketing,Graphic Design,Branding,Yes
