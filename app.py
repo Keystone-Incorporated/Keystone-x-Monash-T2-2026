@@ -170,9 +170,11 @@ app.layout = html.Div(
                         "fontSize": "32px",
                     },
                 ),
-                html.Div(
-                    "Business Search Dashboard",
-                    style={"color": "white", "fontSize": "16px"},
+                html.A(
+                    "🌐keystone.org.au",
+                    href="https://www.keystone.org.au/",
+                    target="_blank",
+                    style={"color": "white", "fontSize": "16px", "fontWeight": "bold"},
                 ),
             ],
         ),
