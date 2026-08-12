@@ -199,7 +199,7 @@ app.layout = html.Div(
                         dcc.Input(
                             id="search-input", type="text", placeholder="Search by business name...",
                             debounce=True,
-                            style={"width": "100%", "padding": "14px", "marginTop": "8px", "marginBottom": "20px", "borderRadius": "10px", "border": "1px solid #CCCCCC", "fontSize": "16px"},
+                            style={"width": "100%", "padding": "18px 14px", "marginTop": "8px", "marginBottom": "20px", "borderRadius": "10px", "border": "1px solid #CCCCCC", "fontSize": "16px"},
                         ),
                         html.Div(
                             style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit, minmax(190px, 1fr))", "gap": "16px"},
