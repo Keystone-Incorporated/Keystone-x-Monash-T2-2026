@@ -1,11 +1,43 @@
 from pathlib import Path
 import json
 import base64
+import os
+import secrets
 from datetime import datetime
 import pandas as pd
 from dash import Dash, Input, Output, State, dash_table, dcc, html, ctx, ALL
 from dash.exceptions import PreventUpdate
 from dash import no_update
+from flask import Response, has_request_context, request, session
+
+
+# ── Local environment and access protection ─────────────────────────────────
+def load_local_env():
+    """Load simple KEY=VALUE settings from the ignored local .env file."""
+    env_file = Path(__file__).with_name(".env")
+    if not env_file.exists():
+        return
+
+    for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            os.environ.setdefault(key, value)
+
+
+load_local_env()
+ACCESS_PASSWORD = os.getenv("DASH_ACCESS_PASSWORD")
+SESSION_SECRET = os.getenv("DASH_SESSION_SECRET") or secrets.token_urlsafe(32)
+
+if not ACCESS_PASSWORD:
+    raise RuntimeError(
+        "DASH_ACCESS_PASSWORD is not set. Add it to the local .env file "
+        "before starting the dashboard."
+    )
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 DATA_FILE = Path(__file__).with_name("Merged_Business_Data.csv")
@@ -157,6 +189,46 @@ TABLE_COLS = ["Business Name", "Phone", "Website", "Suburb", "Industry"]
 
 app = Dash(__name__)
 app.title = "Keystone Employer Database"
+app.server.secret_key = SESSION_SECRET
+
+
+PUBLIC_PATHS = {
+    "/",
+    "/_dash-layout",
+    "/_dash-dependencies",
+    "/_dash-config",
+    "/_favicon.ico",
+}
+
+
+def _is_login_callback():
+    """Allow the callback that verifies the password before a session exists."""
+    if request.path != "/_dash-update-component" or request.method != "POST":
+        return False
+
+    payload = request.get_json(silent=True) or {}
+    output = str(payload.get("output", ""))
+    if "auth-session" in output:
+        return True
+
+    outputs = payload.get("outputs") or []
+    return any("auth-session" in str(item) for item in outputs)
+
+
+@app.server.before_request
+def protect_dashboard():
+    path = request.path
+    if (
+        path in PUBLIC_PATHS
+        or path.startswith("/_dash-component-suites/")
+        or path.startswith("/assets/")
+        or _is_login_callback()
+        or session.get("authenticated") is True
+    ):
+        return None
+
+    return Response("Authentication required.", 401)
+
 
 app.index_string = """
 <!DOCTYPE html>
@@ -210,7 +282,7 @@ app.index_string = """
 </html>
 """
 
-app.layout = html.Div(
+dashboard_layout = html.Div(
     style={"backgroundColor": "#4200A8", "minHeight": "100vh", "fontFamily": "Arial, sans-serif", "margin": "0", "paddingBottom": "70px"},
     children=[
         dcc.Store(id="current-business-store", storage_type="memory"),
@@ -328,6 +400,167 @@ app.layout = html.Div(
     ],
 )
 
+
+def _login_container_style(authenticated):
+    return {
+        "display": "none" if authenticated else "flex",
+        "minHeight": "100vh",
+        "backgroundColor": "#4200A8",
+        "alignItems": "center",
+        "justifyContent": "center",
+        "padding": "24px",
+    }
+
+
+def _dashboard_container_style(authenticated):
+    return {"display": "block" if authenticated else "none"}
+
+
+def build_login_page(authenticated=False):
+    return html.Div(
+        id="login-container",
+        style=_login_container_style(authenticated),
+        children=[
+            html.Div(
+                style={
+                    "width": "100%",
+                    "maxWidth": "460px",
+                    "backgroundColor": "white",
+                    "borderRadius": "24px",
+                    "padding": "42px",
+                    "boxShadow": "0 18px 45px rgba(0,0,0,0.28)",
+                    "textAlign": "center",
+                },
+                children=[
+                    html.Img(
+                        src=logo_src,
+                        style={"height": "62px", "maxWidth": "100%", "marginBottom": "22px"},
+                    ) if logo_src else html.H1(
+                        "Keystone",
+                        style={"color": "#4200A8", "marginBottom": "22px"},
+                    ),
+                    html.H1(
+                        "Employer Database",
+                        style={
+                            "color": "#2E1654",
+                            "fontSize": "28px",
+                            "margin": "0 0 10px",
+                        },
+                    ),
+                    html.P(
+                        "Enter the access password to view the dashboard.",
+                        style={
+                            "color": "#6F5A8C",
+                            "fontSize": "15px",
+                            "margin": "0 0 26px",
+                        },
+                    ),
+                    dcc.Input(
+                        id="login-password",
+                        type="password",
+                        placeholder="Access password",
+                        n_submit=0,
+                        style={
+                            "width": "100%",
+                            "height": "48px",
+                            "padding": "12px 14px",
+                            "borderRadius": "10px",
+                            "border": "1px solid #CCCCCC",
+                            "fontSize": "16px",
+                            "marginBottom": "14px",
+                        },
+                    ),
+                    html.Button(
+                        "Sign in",
+                        id="login-submit-btn",
+                        n_clicks=0,
+                        style={
+                            "width": "100%",
+                            "height": "48px",
+                            "border": "none",
+                            "borderRadius": "10px",
+                            "backgroundColor": "#66F2E3",
+                            "color": "#2E1654",
+                            "fontSize": "16px",
+                            "fontWeight": "bold",
+                            "cursor": "pointer",
+                        },
+                    ),
+                    html.Div(
+                        id="login-message",
+                        style={
+                            "color": "#B42318",
+                            "fontSize": "14px",
+                            "minHeight": "22px",
+                            "marginTop": "14px",
+                        },
+                    ),
+                ],
+            )
+        ],
+    )
+
+
+def serve_layout():
+    authenticated = (
+        has_request_context() and session.get("authenticated") is True
+    )
+    return html.Div(
+        style={"minHeight": "100vh", "backgroundColor": "#4200A8"},
+        children=[
+            dcc.Store(
+                id="auth-session",
+                data={"authenticated": authenticated},
+                storage_type="session",
+            ),
+            build_login_page(authenticated),
+            html.Div(
+                id="dashboard-container",
+                style=_dashboard_container_style(authenticated),
+                children=[dashboard_layout],
+            ),
+        ],
+    )
+
+
+app.layout = serve_layout
+
+
+@app.callback(
+    Output("auth-session", "data"),
+    Output("login-message", "children"),
+    Output("login-password", "value"),
+    Output("login-container", "style"),
+    Output("dashboard-container", "style"),
+    Input("login-submit-btn", "n_clicks"),
+    State("login-password", "value"),
+    prevent_initial_call=True,
+)
+def authenticate_user(n_clicks, password):
+    if not n_clicks:
+        raise PreventUpdate
+
+    password_text = "" if password is None else str(password)
+    if secrets.compare_digest(password_text, ACCESS_PASSWORD):
+        session["authenticated"] = True
+        return (
+            {"authenticated": True},
+            "",
+            "",
+            _login_container_style(True),
+            _dashboard_container_style(True),
+        )
+
+    session.pop("authenticated", None)
+    return (
+        {"authenticated": False},
+        "Incorrect password. Please try again.",
+        "",
+        _login_container_style(False),
+        _dashboard_container_style(False),
+    )
+
+
 @app.callback(
     Output("business-table", "data"),
     Output("result-count", "children"),
@@ -346,8 +579,9 @@ app.layout = html.Div(
     Input("review-rating-filter", "value"),
     Input("favourites-only-filter", "value"),
     Input("fav-update-trigger", "data"),
+    Input("auth-session", "data"),
 )
-def update_table(search, industry, category, suburb, accessibility, review_count, review_rating, fav_only, _trig):
+def update_table(search, industry, category, suburb, accessibility, review_count, review_rating, fav_only, _trig, _auth):
     fav_set = load_favourites()
     selected = {
         "search": search, "industry": industry, "category": category,

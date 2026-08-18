@@ -219,3 +219,7 @@ __marimo__/
 
 # Local development tools
 .local-tools/
+
+# Local launch scripts
+start_dashboard.bat
+stop_dashboard.bat
