@@ -295,7 +295,32 @@ dashboard_layout = html.Div(
             style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "padding": "25px 45px", "borderBottom": "1px solid rgba(255,255,255,0.15)"},
             children=[
                 html.Img(src=logo_src, style={"height": "55px"}) if logo_src else html.H1("Keystone Employer Database", style={"color": "#66F2E3", "margin": "0", "fontSize": "32px"}),
-                html.A("🌐 keystone.org.au", href="https://www.keystone.org.au/", target="_blank", style={"color": "white", "fontSize": "16px", "fontWeight": "bold", "textDecoration": "none"}),
+                html.Div(
+                    style={"display": "flex", "alignItems": "center", "gap": "16px"},
+                    children=[
+                        html.A(
+                            "🌐 keystone.org.au",
+                            href="https://www.keystone.org.au/",
+                            target="_blank",
+                            style={"color": "white", "fontSize": "16px", "fontWeight": "bold", "textDecoration": "none"},
+                        ),
+                        html.Button(
+                            "Log out",
+                            id="logout-btn",
+                            n_clicks=0,
+                            style={
+                                "backgroundColor": "transparent",
+                                "color": "white",
+                                "border": "1px solid #66F2E3",
+                                "borderRadius": "20px",
+                                "padding": "8px 15px",
+                                "fontSize": "14px",
+                                "fontWeight": "bold",
+                                "cursor": "pointer",
+                            },
+                        ),
+                    ],
+                ),
             ],
         ),
 
@@ -534,11 +559,24 @@ app.layout = serve_layout
     Output("login-container", "style"),
     Output("dashboard-container", "style"),
     Input("login-submit-btn", "n_clicks"),
+    Input("logout-btn", "n_clicks"),
     State("login-password", "value"),
     prevent_initial_call=True,
 )
-def authenticate_user(n_clicks, password):
-    if not n_clicks:
+def authenticate_user(n_clicks, logout_clicks, password):
+    if ctx.triggered_id == "logout-btn":
+        if not logout_clicks:
+            raise PreventUpdate
+        session.pop("authenticated", None)
+        return (
+            {"authenticated": False},
+            "",
+            "",
+            _login_container_style(False),
+            _dashboard_container_style(False),
+        )
+
+    if ctx.triggered_id != "login-submit-btn" or not n_clicks:
         raise PreventUpdate
 
     password_text = "" if password is None else str(password)
