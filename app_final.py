@@ -189,7 +189,8 @@ TABLE_COLS = ["Business Name", "Phone", "Website", "Suburb", "Industry"]
 
 app = Dash(__name__)
 app.title = "Keystone Employer Database"
-app.server.secret_key = SESSION_SECRET
+server = app.server
+server.secret_key = SESSION_SECRET
 
 
 PUBLIC_PATHS = {
