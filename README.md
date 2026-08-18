@@ -19,9 +19,21 @@ For a quick start on Windows, double-click `start_dashboard.bat`.
 Alternatively, run:
 
 ```powershell
-python app.py
+python app_final.py
 ```
 
 Then open your browser and go to:
 
 http://127.0.0.1:8050/
+
+## Deployment
+
+The dashboard is currently hosted on Render.
+
+Production/testing URL:
+https://keystone-employer-dashboard.onrender.com
+
+Access is password protected.
+
+Deployment from the `main` branch is currently manual to prevent
+untested commits from automatically affecting the hosted dashboard.
