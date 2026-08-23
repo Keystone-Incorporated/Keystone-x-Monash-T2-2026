@@ -9,6 +9,7 @@ from dash import Dash, Input, Output, State, dash_table, dcc, html, ctx, ALL
 from dash.exceptions import PreventUpdate
 from dash import no_update
 from flask import Response, has_request_context, request, session
+from industry_map import derive_industry
 
 
 # ── Local environment and access protection ─────────────────────────────────
@@ -98,9 +99,14 @@ for col in ["Reviews Count", "Total Score"]:
 if "Favourite" not in businesses.columns:
     businesses["Favourite"] = "No"
 
+if "Industry" not in businesses.columns:
+    businesses["Industry"] = ""
+needs_industry = businesses["Industry"].astype(str).str.strip() == ""
+businesses.loc[needs_industry, "Industry"] = businesses.loc[needs_industry, "Category"].apply(derive_industry)
+
 required_columns = [
     "Business Name", "Phone", "Email", "Website", "Address",
-    "Google Maps", "Industry", "Category", "Suburb",
+    "Google Maps", "Category", "Suburb",
     "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun",
     "Assistive Hearing Loop", "Wheelchair Accessible Entrance",
     "Wheelchair Accessible Parking Lot", "Wheelchair Accessible Restroom",
@@ -334,8 +340,14 @@ dashboard_layout = html.Div(
                         html.Div(
                             style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit, minmax(190px, 1fr))", "gap": "16px"},
                             children=[
-                                dcc.Dropdown(id="industry-filter", placeholder="🏭 Industry", clearable=True),
-                                dcc.Dropdown(id="category-filter", placeholder="📂 Category", clearable=True),
+                                html.Div(children=[
+                                    dcc.Dropdown(id="industry-filter", placeholder="🏭 Industry", clearable=True),
+                                    html.Div(
+                                        id="category-filter-wrapper",
+                                        style={"display": "none"},
+                                        children=[dcc.Dropdown(id="category-filter", placeholder="📂 Category", clearable=True)],
+                                    ),
+                                ]),
                                 dcc.Dropdown(id="suburb-filter", placeholder="📍 Suburb", clearable=True),
                                 dcc.Dropdown(
                                     id="accessibility-filter",
@@ -590,6 +602,23 @@ def authenticate_user(n_clicks, logout_clicks, password):
 
 
 @app.callback(
+    Output("category-filter-wrapper", "style"),
+    Output("category-filter", "value"),
+    Input("industry-filter", "value"),
+)
+def toggle_category_filter(industry):
+    if industry:
+        return {
+            "display": "block",
+            "marginTop": "8px",
+            "marginLeft": "24px",
+            "paddingLeft": "14px",
+            "borderLeft": "3px solid #66F2E3",
+        }, None
+    return {"display": "none"}, None
+
+
+@app.callback(
     Output("business-table", "data"),
     Output("result-count", "children"),
     Output("industry-filter", "options"),
@@ -730,7 +759,7 @@ def _build_modal_content(business_name, row):
     email_val = row.get("Email")
     if not email_val or str(email_val).strip() == "":
         email_val = "—"
-    
+
     contact_fields = [
         _detail_field("Phone", row.get("Phone"), icon="📞"),
         _detail_field("Email", email_val, icon="✉️"),
@@ -957,5 +986,3 @@ def manage_comments(add_clicks, delete_clicks_list, business_name, text):
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=8050, debug=False)
-
-
