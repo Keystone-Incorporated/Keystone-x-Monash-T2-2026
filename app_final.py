@@ -131,10 +131,6 @@ REVIEW_COUNT_OPTIONS = [
 
 ACCESSIBILITY_OPTIONS = [{"label": f, "value": f} for f in ACCESSIBILITY_FEATURES]
 
-# Seed Industry/Category/Suburb with their full option lists up front too (same
-# idea as ACCESSIBILITY_OPTIONS/REVIEW_COUNT_OPTIONS above), so the dropdown has
-# something to show the instant the page loads instead of waiting on a callback
-# round-trip through the msf-store to populate it.
 INDUSTRY_OPTIONS = make_options(businesses["Industry"])
 CATEGORY_OPTIONS = make_options(businesses["Category"])
 SUBURB_OPTIONS = make_options(businesses["Suburb"])
@@ -168,12 +164,10 @@ def apply_filters(
     if suburb and "suburb" not in ignore:
         filtered = filtered[filtered["Suburb"].isin(suburb)]
     if accessibility and "accessibility" not in ignore:
-        # AND semantics: business must have every selected accessibility feature
         for feature in accessibility:
             if feature in filtered.columns:
                 filtered = filtered[filtered[feature] == True]
     if review_count and "review_count" not in ignore:
-        # OR semantics: business matches any of the selected buckets
         masks = []
         if "Less than 50" in review_count:
             masks.append(filtered["Reviews Count"] < 50)
@@ -195,7 +189,6 @@ def apply_filters(
 
 
 def compute_accessibility_options(data):
-    """Only include accessibility features that at least one row (in `data`) has."""
     opts = []
     for feature in ACCESSIBILITY_FEATURES:
         if feature in data.columns and bool((data[feature] == True).any()):
@@ -204,7 +197,6 @@ def compute_accessibility_options(data):
 
 
 def compute_review_count_options(data):
-    """Only include review-count buckets that at least one row (in `data`) falls into."""
     opts = []
     counts = data["Reviews Count"]
     if (counts < 50).any():
@@ -217,11 +209,6 @@ def compute_review_count_options(data):
 
 
 def multi_filter(name, placeholder, options=None):
-    """Checkbox-style multi-select filter (search + select all + 'N selected' summary).
-
-    ``name`` is the pattern-matching index shared by the filter's sub-components.
-    Dynamic option lists are fed later through the ``msf-store`` store.
-    """
     options = options or []
     return html.Div(
         className="msf",
@@ -243,7 +230,6 @@ def multi_filter(name, placeholder, options=None):
                     ),
                 ],
             ),
-            # Sibling (not child) of the toggle so clicks don't bubble and open the panel
             html.Button(
                 "✕",
                 id={"type": "msf-clear", "index": name},
@@ -295,7 +281,6 @@ def multi_filter(name, placeholder, options=None):
 
 
 def favourites_toggle():
-    """Standalone single-select toggle (not a dropdown) for the Favourites filter."""
     return html.Div(
         className="msf",
         children=[
@@ -316,9 +301,10 @@ def favourites_toggle():
         ],
     )
 
+
 TABLE_COLS = ["Business Name", "Phone", "Website", "Suburb", "Industry"]
 
-app = Dash(__name__)
+app = Dash(__name__, suppress_callback_exceptions=True)
 app.title = "Keystone Employer Database"
 server = app.server
 server.secret_key = SESSION_SECRET
@@ -334,7 +320,6 @@ PUBLIC_PATHS = {
 
 
 def _is_login_callback():
-    """Allow the callback that verifies the password before a session exists."""
     if request.path != "/_dash-update-component" or request.method != "POST":
         return False
 
@@ -360,7 +345,6 @@ def protect_dashboard():
         return None
 
     return Response("Authentication required.", 401)
-
 
 app.index_string = """
 <!DOCTYPE html>
@@ -390,7 +374,6 @@ app.index_string = """
         .dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner td {
             cursor: pointer;
         }
-        /* Remove red highlight on active/selected/focused cells */
         .dash-spreadsheet-container .dash-spreadsheet-inner td.focused,
         .dash-spreadsheet-container .dash-spreadsheet-inner td.cell--selected,
         .dash-spreadsheet-container .dash-spreadsheet-inner td:active {
@@ -399,7 +382,6 @@ app.index_string = """
             outline: none !important;
             background-color: transparent !important;
         }
-        /* Force uniform row height */
         .dash-spreadsheet-container .dash-spreadsheet-inner td {
             height: 50px !important;
             min-height: 50px !important;
@@ -409,9 +391,8 @@ app.index_string = """
             display: flex;
             align-items: center;
         }
-        /* Orange "No Website" button for empty website cells */
-        .dash-spreadsheet-container td[data-dash-column="Website"] > div:not(:has(a)) {
-            justify-content: flex-start;
+        .dash-spreadsheet-container td[data-dash-column="Website"] > div {
+            justify-content: center;
             align-items: center;
         }
         .dash-spreadsheet-container td[data-dash-column="Website"] > div:not(:has(a))::before {
@@ -446,7 +427,9 @@ app.index_string = """
             max-width: 800px;
             width: 100%;
             max-height: 90vh;
-            overflow-y: auto;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
             box-shadow: 0 20px 50px rgba(0,0,0,0.3);
         }
 
@@ -566,6 +549,10 @@ app.index_string = """
                 var btn = document.getElementById('msf-outside-trigger');
                 if (btn) { btn.click(); }
             }
+            if (e.target.id === 'modal-overlay') {
+                var closeBtn = document.getElementById('close-modal-btn');
+                if (closeBtn) { closeBtn.click(); }
+            }
         });
     </script>
     </body>
@@ -578,6 +565,8 @@ dashboard_layout = html.Div(
         dcc.Store(id="current-business-store", storage_type="memory"),
         dcc.Store(id="fav-update-trigger", data=0),
         dcc.Store(id="comment-update-trigger", data=0),
+        dcc.Store(id="edit-mode-store", data=False),
+        dcc.Store(id="edit-save-trigger", data=None),
         dcc.Store(id="msf-active", data=None),
         html.Button(id="msf-outside-trigger", n_clicks=0, style={"display": "none"}),
 
@@ -619,7 +608,6 @@ dashboard_layout = html.Div(
         html.Div(
             style={"maxWidth": "1500px", "margin": "0 auto", "padding": "45px 30px"},
             children=[
-                # Aligned heading + subtitle
                 html.Div(
                     style={"display": "grid", "gridTemplateColumns": "50px 1fr", "alignItems": "baseline", "marginBottom": "30px"},
                     children=[
@@ -652,16 +640,11 @@ dashboard_layout = html.Div(
                         html.Div(
                             style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit, minmax(190px, 1fr))", "gap": "16px"},
                             children=[
-                                # Industry + nested Category
+                                multi_filter("industry", "🏭 Industry", options=INDUSTRY_OPTIONS),
                                 html.Div(
-                                    children=[
-                                        multi_filter("industry", "🏭 Industry", options=INDUSTRY_OPTIONS),
-                                        html.Div(
-                                            id="category-filter-wrapper",
-                                            style={"display": "none"},
-                                            children=[multi_filter("category", "📂 Category", options=CATEGORY_OPTIONS)],
-                                        ),
-                                    ]
+                                    id="category-filter-wrapper",
+                                    style={"display": "none"},
+                                    children=[multi_filter("category", "📂 Category", options=CATEGORY_OPTIONS)],
                                 ),
                                 multi_filter("suburb", "📍 Suburb", options=SUBURB_OPTIONS),
                                 multi_filter("accessibility", "🤝 Accessibility", options=ACCESSIBILITY_OPTIONS),
@@ -683,9 +666,9 @@ dashboard_layout = html.Div(
                             active_cell=None,
                             hidden_columns=["_row_idx"],
                             columns=[
-                                {"name": col, "id": col, "presentation": "markdown" if col == "Website" else "input"}
+                                {"name": col, "id": col, "presentation": "markdown" if col == "Website" else "input", "editable": False}
                                 for col in TABLE_COLS
-                            ] + [{"name": "_row_idx", "id": "_row_idx"}],
+                            ] + [{"name": "_row_idx", "id": "_row_idx", "editable": False}],
                             page_size=10,
                             sort_action="native",
                             markdown_options={"link_target": "_blank"},
@@ -722,30 +705,45 @@ dashboard_layout = html.Div(
             children=[
                 html.Div(
                     className="modal-card",
-                    style={"padding": "28px", "position": "relative"},
                     children=[
-                        html.Button(
-                            "✕",
-                            id="close-modal-btn",
-                            n_clicks=0,
+                        html.Div(
                             style={
-                                "position": "absolute",
-                                "top": "16px",
-                                "right": "20px",
-                                "background": "none",
-                                "border": "none",
-                                "fontSize": "20px",
-                                "cursor": "pointer",
-                                "color": "#666",
+                                "padding": "16px 20px 0 0",
+                                "textAlign": "right",
+                                "flexShrink": "0",
+                                "background": "white",
+                                "borderRadius": "20px 20px 0 0",
+                            },
+                            children=[
+                                html.Button(
+                                    "✕",
+                                    id="close-modal-btn",
+                                    n_clicks=0,
+                                    style={
+                                        "background": "none",
+                                        "border": "none",
+                                        "fontSize": "20px",
+                                        "cursor": "pointer",
+                                        "color": "#666",
+                                    }
+                                ),
+                            ],
+                        ),
+                        html.Div(
+                            id="modal-content",
+                            style={
+                                "padding": "0 28px 28px 28px",
+                                "overflowY": "auto",
+                                "flex": "1 1 auto",
                             }
                         ),
-                        html.Div(id="modal-content"),
                     ],
                 ),
             ],
         ),
     ],
 )
+
 
 def _login_container_style(authenticated):
     return {
@@ -871,7 +869,6 @@ def serve_layout():
 
 app.layout = serve_layout
 
-
 @app.callback(
     Output("auth-session", "data"),
     Output("login-message", "children"),
@@ -920,24 +917,18 @@ def authenticate_user(n_clicks, logout_clicks, password):
     )
 
 
-# ── Category filter nesting (shows only when Industry is selected) ───────────
+# ── Category filter visibility (now in its own grid cell) ────────────────────
 @app.callback(
     Output("category-filter-wrapper", "style"),
     Input({"type": "msf-checklist", "index": "industry"}, "value"),
 )
 def toggle_category_wrapper(industry):
     if industry:
-        return {
-            "display": "block",
-            "marginTop": "8px",
-            "marginLeft": "24px",
-            "paddingLeft": "14px",
-            "borderLeft": "3px solid #66F2E3",
-        }
+        return {"display": "block"}
     return {"display": "none"}
 
 
-# ── Multi-select filter machinery (pattern-matching, serves every filter) ────
+# ── Multi-select filter machinery ────────────────────────────────────────────
 @app.callback(
     Output("msf-active", "data"),
     Input({"type": "msf-toggle", "index": ALL}, "n_clicks"),
@@ -1032,7 +1023,7 @@ def msf_label(value, placeholder):
     return text, "msf-label msf-active", {"display": "block"}
 
 
-# ── Favourites (single-select toggle, not a dropdown) ────────────────────────
+# ── Favourites toggle ────────────────────────────────────────────────────────
 @app.callback(
     Output("favourites-toggle-store", "data"),
     Output("favourites-toggle-btn", "className"),
@@ -1050,6 +1041,7 @@ def toggle_favourites_filter(_n_clicks, current):
     return new_state, toggle_class, label_class, icon
 
 
+# ── Table update + dynamic options ───────────────────────────────────────────
 @app.callback(
     Output("business-table", "data"),
     Output("result-count", "children"),
@@ -1068,8 +1060,9 @@ def toggle_favourites_filter(_n_clicks, current):
     Input("favourites-toggle-store", "data"),
     Input("fav-update-trigger", "data"),
     Input("auth-session", "data"),
+    Input("edit-save-trigger", "data"),
 )
-def update_table(search, industry, category, suburb, accessibility, review_count, _clear_clicks, fav_only, _trig, _auth):
+def update_table(search, industry, category, suburb, accessibility, review_count, _clear_clicks, fav_only, _trig, _auth, _edit):
     trig = ctx.triggered_id
     if isinstance(trig, dict) and trig.get("type") == "msf-clear":
         cleared_index = trig["index"]
@@ -1108,8 +1101,6 @@ def update_table(search, industry, category, suburb, accessibility, review_count
 
     display_data = filtered.copy().reset_index().rename(columns={"index": "_row_idx"})
 
-    display_data["Phone"] = display_data["Phone"].replace("", "N/A").fillna("N/A")
-
     display_data["Website"] = display_data["Website"].apply(
         lambda link: f"[🌐 Website]({link})" if str(link).strip() else ""
     )
@@ -1130,6 +1121,7 @@ def update_table(search, industry, category, suburb, accessibility, review_count
     )
 
 
+# ── Modal content builder (with edit mode) ───────────────────────────────────
 def _detail_field(label, value, is_link=False, icon="", link_text="Open link →"):
     label_text = f"{icon} {label}" if icon else label
     if is_link and value:
@@ -1173,7 +1165,7 @@ def _category_card(title, icon, fields):
     )
 
 
-def _build_modal_content(business_name, row):
+def _build_modal_content(business_name, row, edit_mode=False):
     fav_set = load_favourites()
     is_fav = business_name in fav_set
     comments_dict = load_comments()
@@ -1216,13 +1208,31 @@ def _build_modal_content(business_name, row):
     if not email_val or str(email_val).strip() == "":
         email_val = "—"
 
-    contact_fields = [
-        _detail_field("Phone", row.get("Phone"), icon="📞"),
-        _detail_field("Email", email_val, icon="✉️"),
-        _detail_field("Website", row.get("Website"), is_link=True, icon="🌐", link_text="🌐 Website"),
-        _detail_field("Address", row.get("Address"), icon="📍"),
-        _detail_field("Google Maps", row.get("Google Maps"), is_link=True, icon="🗺️", link_text="🗺️ Directions"),
-    ]
+    # Contact fields
+    if edit_mode:
+        contact_fields = [
+            html.Div([
+                html.Strong("📞 Phone: ", style={"color": "#2E1654"}),
+                dcc.Input(id="edit-phone", value=str(row.get("Phone", "")), type="text",
+                          style={"padding": "6px 10px", "borderRadius": "6px", "border": "1px solid #CCCCCC", "fontSize": "14px", "width": "200px"})
+            ], style={"marginBottom": "10px"}),
+            html.Div([
+                html.Strong("✉️ Email: ", style={"color": "#2E1654"}),
+                dcc.Input(id="edit-email", value=str(row.get("Email", "")), type="text",
+                          style={"padding": "6px 10px", "borderRadius": "6px", "border": "1px solid #CCCCCC", "fontSize": "14px", "width": "300px"})
+            ], style={"marginBottom": "10px"}),
+            _detail_field("Website", row.get("Website"), is_link=True, icon="🌐", link_text="🌐 Website"),
+            _detail_field("Address", row.get("Address"), icon="📍"),
+            _detail_field("Google Maps", row.get("Google Maps"), is_link=True, icon="🗺️", link_text="🗺️ Directions"),
+        ]
+    else:
+        contact_fields = [
+            _detail_field("Phone", row.get("Phone"), icon="📞"),
+            _detail_field("Email", email_val, icon="✉️"),
+            _detail_field("Website", row.get("Website"), is_link=True, icon="🌐", link_text="🌐 Website"),
+            _detail_field("Address", row.get("Address"), icon="📍"),
+            _detail_field("Google Maps", row.get("Google Maps"), is_link=True, icon="🗺️", link_text="🗺️ Directions"),
+        ]
 
     rc = row.get("Reviews Count")
     if pd.isna(rc) or rc == "" or rc is None:
@@ -1236,10 +1246,26 @@ def _build_modal_content(business_name, row):
     else:
         ts_display = str(ts)
 
-    specs_fields = [
-        _detail_field("Category", row.get("Category"), icon="📂"),
-        _detail_field("Industry", row.get("Industry"), icon="🏭"),
-    ]
+    # Specs fields
+    if edit_mode:
+        specs_fields = [
+            html.Div([
+                html.Strong("📂 Category: ", style={"color": "#2E1654"}),
+                dcc.Input(id="edit-category", value=str(row.get("Category", "")), type="text",
+                          style={"padding": "6px 10px", "borderRadius": "6px", "border": "1px solid #CCCCCC", "fontSize": "14px", "width": "250px"})
+            ], style={"marginBottom": "10px"}),
+            html.Div([
+                html.Strong("🏭 Industry: ", style={"color": "#2E1654"}),
+                dcc.Input(id="edit-industry", value=str(row.get("Industry", "")), type="text",
+                          style={"padding": "6px 10px", "borderRadius": "6px", "border": "1px solid #CCCCCC", "fontSize": "14px", "width": "250px"})
+            ], style={"marginBottom": "10px"}),
+        ]
+    else:
+        specs_fields = [
+            _detail_field("Category", row.get("Category"), icon="📂"),
+            _detail_field("Industry", row.get("Industry"), icon="🏭"),
+        ]
+    
     for day in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]:
         val = row.get(day, "")
         if not val or str(val).strip() == "":
@@ -1255,6 +1281,49 @@ def _build_modal_content(business_name, row):
         val = row.get(feature)
         display_val = "Yes" if val == True else "—"
         accessibility_fields.append(_detail_field(feature, display_val))
+
+    if edit_mode:
+        action_buttons = html.Div(
+            style={"display": "flex", "gap": "12px", "marginBottom": "20px"},
+            children=[
+                html.Button(
+                    "💾 Save changes",
+                    id="save-edit-btn",
+                    n_clicks=0,
+                    style={
+                        "background": "#66F2E3", "color": "#2E1654", "border": "none",
+                        "padding": "10px 20px", "borderRadius": "8px",
+                        "fontWeight": "bold", "cursor": "pointer", "fontSize": "14px"
+                    }
+                ),
+                html.Button(
+                    "Cancel",
+                    id="cancel-edit-btn",
+                    n_clicks=0,
+                    style={
+                        "background": "white", "color": "#2E1654", "border": "1px solid #CCCCCC",
+                        "padding": "10px 20px", "borderRadius": "8px",
+                        "fontWeight": "bold", "cursor": "pointer", "fontSize": "14px"
+                    }
+                ),
+            ]
+        )
+    else:
+        action_buttons = html.Div(
+            style={"marginBottom": "20px"},
+            children=[
+                html.Button(
+                    "✏️ Edit details",
+                    id="edit-details-btn",
+                    n_clicks=0,
+                    style={
+                        "background": "white", "color": "#2E1654", "border": "1px solid #4200A8",
+                        "padding": "10px 20px", "borderRadius": "8px",
+                        "fontWeight": "bold", "cursor": "pointer", "fontSize": "14px"
+                    }
+                ),
+            ]
+        )
 
     return html.Div([
         html.Div([
@@ -1280,6 +1349,8 @@ def _build_modal_content(business_name, row):
                 }
             ),
         ], style={"display": "flex", "alignItems": "center", "marginBottom": "20px", "paddingRight": "40px"}),
+
+        action_buttons,
 
         _category_card("Business Contact", "📇", contact_fields),
         _category_card("Business Specs", "📋", specs_fields),
@@ -1313,7 +1384,6 @@ def _build_modal_content(business_name, row):
     ])
 
 
-
 @app.callback(
     Output("modal-overlay", "style"),
     Output("modal-content", "children"),
@@ -1323,16 +1393,18 @@ def _build_modal_content(business_name, row):
     Input("fav-update-trigger", "data"),
     Input("comment-update-trigger", "data"),
     Input("close-modal-btn", "n_clicks"),
+    Input("edit-mode-store", "data"),
+    Input("edit-save-trigger", "data"),
     State("current-business-store", "data"),
     prevent_initial_call=True,
 )
-def update_modal(active_cell, _fav, _com, close_clicks, current_business):
+def update_modal(active_cell, _fav, _com, close_clicks, edit_mode, _edit_save, current_business):
     triggered = ctx.triggered_id
 
     if triggered == "close-modal-btn" and close_clicks:
         return {"display": "none"}, html.Div(), None, None
 
-    if triggered in ("fav-update-trigger", "comment-update-trigger"):
+    if triggered in ("fav-update-trigger", "comment-update-trigger", "edit-save-trigger"):
         if not current_business:
             raise PreventUpdate
         business_name = current_business
@@ -1340,7 +1412,18 @@ def update_modal(active_cell, _fav, _com, close_clicks, current_business):
         if match.empty:
             raise PreventUpdate
         row = match.iloc[0].to_dict()
-        detail = _build_modal_content(business_name, row)
+        detail = _build_modal_content(business_name, row, edit_mode=False if triggered == "edit-save-trigger" else edit_mode)
+        return {"display": "flex"}, detail, business_name, no_update
+
+    if triggered == "edit-mode-store":
+        if not current_business:
+            raise PreventUpdate
+        business_name = current_business
+        match = businesses[businesses["Business Name"] == business_name]
+        if match.empty:
+            raise PreventUpdate
+        row = match.iloc[0].to_dict()
+        detail = _build_modal_content(business_name, row, edit_mode=edit_mode)
         return {"display": "flex"}, detail, business_name, no_update
 
     if not active_cell:
@@ -1359,8 +1442,71 @@ def update_modal(active_cell, _fav, _com, close_clicks, current_business):
     if not business_name:
         raise PreventUpdate
 
-    detail = _build_modal_content(business_name, row)
+    detail = _build_modal_content(business_name, row, edit_mode=False)
     return {"display": "flex"}, detail, business_name, no_update
+
+
+@app.callback(
+    Output("edit-mode-store", "data"),
+    Input("edit-details-btn", "n_clicks", allow_optional=True),
+    Input("cancel-edit-btn", "n_clicks", allow_optional=True),
+    prevent_initial_call=True,
+)
+def handle_edit_mode(edit_clicks, cancel_clicks):
+    triggered = ctx.triggered_id
+
+    if triggered == "edit-details-btn":
+        return True
+
+    if triggered == "cancel-edit-btn":
+        return False
+
+    raise PreventUpdate
+
+@app.callback(
+    Output("edit-save-trigger", "data"),
+    Output("edit-mode-store", "data", allow_duplicate=True),
+
+    Input("save-edit-btn", "n_clicks", allow_optional=True),
+
+    State("edit-industry", "value", allow_optional=True),
+    State("edit-category", "value", allow_optional=True),
+    State("edit-phone", "value", allow_optional=True),
+    State("edit-email", "value", allow_optional=True),
+    State("current-business-store", "data"),
+
+    prevent_initial_call=True,
+)
+def save_business_details(
+    save_clicks,
+    industry_val,
+    category_val,
+    phone_val,
+    email_val,
+    business_name,
+):
+    if not save_clicks or not business_name:
+        raise PreventUpdate
+
+    match = businesses[businesses["Business Name"] == business_name]
+
+    if match.empty:
+        raise PreventUpdate
+
+    idx = match.index[0]
+
+    businesses.loc[idx, "Industry"] = str(industry_val or "").strip()
+    businesses.loc[idx, "Category"] = str(category_val or "").strip()
+    businesses.loc[idx, "Phone"] = str(phone_val or "").strip()
+    businesses.loc[idx, "Email"] = str(email_val or "").strip()
+
+    businesses.to_csv(
+        DATA_FILE,
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+    return datetime.now().isoformat(), False
 
 
 @app.callback(
