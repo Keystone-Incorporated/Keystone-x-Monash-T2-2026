@@ -10,6 +10,8 @@ from dash.exceptions import PreventUpdate
 from dash import no_update
 from flask import Response, has_request_context, request, session
 
+from industry_map import derive_industry
+
 
 # ── Local environment and access protection ─────────────────────────────────
 def load_local_env():
@@ -110,17 +112,106 @@ missing = [c for c in required_columns if c not in businesses.columns]
 if missing:
     raise ValueError("Missing columns: " + ", ".join(missing))
 
+_placeholder_industry = {"", "hospitality", "retail"}
+_needs_industry = businesses["Industry"].astype(str).str.strip().str.lower().isin(_placeholder_industry)
+businesses.loc[_needs_industry, "Industry"] = businesses.loc[_needs_industry, "Category"].apply(derive_industry)
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def make_options(values):
     clean = sorted({str(v).strip() for v in values if str(v).strip()})
     return [{"label": v, "value": v} for v in clean]
 
-ACCESSIBILITY_FEATURES = [
+
+def get_val(row, col):
+    if col not in row.index:
+        return None
+    v = row[col]
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return v
+
+
+def to_tri_state(value):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if value == True:
+        return True
+    if value == False:
+        return False
+    return None
+
+
+WHEELCHAIR_COLS = [
+    "Wheelchair Accessible Entrance", "Wheelchair Accessible Parking Lot",
+    "Wheelchair Accessible Restroom", "Wheelchair Accessible Seating",
+]
+LOUD_COLS = ["Dancing", "Karaoke", "Live-Music", "Live-Performances"]
+FAMILY_COLS = [
+    "Good For Kids", "Good For Kids Birthday", "Has Changing Table(s)",
+    "Highchairs", "Kid-Friendly activities", "Kid's Menu",
+    "Nursing Room", "Playground",
+]
+
+
+def wheelchair_status(row):
+    vals = [get_val(row, c) for c in WHEELCHAIR_COLS]
+    if any(v == True for v in vals):
+        return True
+    if any(v is not None for v in vals):
+        return False
+    return None
+
+
+def quiet_status(row):
+    return to_tri_state(get_val(row, "Quiet"))
+
+
+def loud_status(row):
+    vals = [get_val(row, c) for c in LOUD_COLS]
+    if any(v == True for v in vals):
+        return True
+    return None
+
+
+def family_friendly_status(row):
+    vals = [get_val(row, c) for c in FAMILY_COLS]
+    if any(v == True for v in vals):
+        return True
+    return None
+
+
+def lgbtq_status(row):
+    trans = get_val(row, "Transgender Safe Space")
+    gender_neutral = get_val(row, "Gender-Neutral Toilets")
+    lgbtq = get_val(row, "LGBTQ+ Friendly")
+    if trans == True or gender_neutral == True or lgbtq == True:
+        return True
+    if trans == False or lgbtq == False:
+        return False
+    return None
+
+
+businesses["Wheelchair Accessible (Likely)"] = businesses.apply(wheelchair_status, axis=1)
+businesses["Sensory Sensitivity (Quiet)"] = businesses.apply(quiet_status, axis=1)
+businesses["Sensory Sensitivity (Loud)"] = businesses.apply(loud_status, axis=1)
+businesses["Family-Friendly"] = businesses.apply(family_friendly_status, axis=1)
+businesses["LGBTQ+ Friendly (Likely)"] = businesses.apply(lgbtq_status, axis=1)
+
+ADVANCED_OPTIONS_FEATURES = [
     "Assistive Hearing Loop",
-    "Wheelchair Accessible Entrance",
-    "Wheelchair Accessible Parking Lot",
-    "Wheelchair Accessible Restroom",
-    "Wheelchair Accessible Seating",
+    "Wheelchair Accessible (Likely)",
+    "Sensory Sensitivity (Quiet)",
+    "Sensory Sensitivity (Loud)",
+    "Family-Friendly",
+    "LGBTQ+ Friendly (Likely)",
 ]
 
 REVIEW_COUNT_OPTIONS = [
@@ -129,7 +220,7 @@ REVIEW_COUNT_OPTIONS = [
     {"label": "200+", "value": "200+"},
 ]
 
-ACCESSIBILITY_OPTIONS = [{"label": f, "value": f} for f in ACCESSIBILITY_FEATURES]
+ADVANCED_OPTIONS_OPTIONS = [{"label": f, "value": f} for f in ADVANCED_OPTIONS_FEATURES]
 
 INDUSTRY_OPTIONS = make_options(businesses["Industry"])
 CATEGORY_OPTIONS = make_options(businesses["Category"])
@@ -190,7 +281,7 @@ def apply_filters(
 
 def compute_accessibility_options(data):
     opts = []
-    for feature in ACCESSIBILITY_FEATURES:
+    for feature in ADVANCED_OPTIONS_FEATURES:
         if feature in data.columns and bool((data[feature] == True).any()):
             opts.append({"label": feature, "value": feature})
     return opts
@@ -362,6 +453,7 @@ app.index_string = """
             text-decoration: none;
             font-weight: bold;
             font-size: 13px;
+            line-height: 1;
             transition: transform 0.1s, box-shadow 0.1s;
         }
         .dash-table-container a:hover {
@@ -394,6 +486,9 @@ app.index_string = """
         .dash-spreadsheet-container td[data-dash-column="Website"] > div {
             justify-content: center;
             align-items: center;
+        }
+        .dash-spreadsheet-container td[data-dash-column="Website"] > div p {
+            margin: 0;
         }
         .dash-spreadsheet-container td[data-dash-column="Website"] > div:not(:has(a))::before {
             content: "No Website";
@@ -647,7 +742,7 @@ dashboard_layout = html.Div(
                                     children=[multi_filter("category", "📂 Category", options=CATEGORY_OPTIONS)],
                                 ),
                                 multi_filter("suburb", "📍 Suburb", options=SUBURB_OPTIONS),
-                                multi_filter("accessibility", "🤝 Accessibility", options=ACCESSIBILITY_OPTIONS),
+                                multi_filter("accessibility", "⚙️ Advanced Options", options=ADVANCED_OPTIONS_OPTIONS),
                                 multi_filter("review_count", "💬 Review count", options=REVIEW_COUNT_OPTIONS),
                                 favourites_toggle(),
                             ],
@@ -1276,11 +1371,24 @@ def _build_modal_content(business_name, row, edit_mode=False):
         _detail_field("Rating", ts_display, icon="⭐"),
     ])
 
-    accessibility_fields = []
-    for feature in ACCESSIBILITY_FEATURES:
-        val = row.get(feature)
-        display_val = "Yes" if val == True else "—"
-        accessibility_fields.append(_detail_field(feature, display_val))
+    def optional_field(label, tri_state, icon=""):
+        if tri_state is None:
+            return None
+        return _detail_field(label, "Yes" if tri_state else "No", icon=icon)
+
+    additional_info_fields = [
+        optional_field("Assistive Hearing Loop", to_tri_state(row.get("Assistive Hearing Loop")), icon="🦻"),
+        optional_field("Wheelchair Accessible (Likely)", to_tri_state(row.get("Wheelchair Accessible (Likely)")), icon="♿"),
+        optional_field("Wheelchair Accessible Entrance", to_tri_state(row.get("Wheelchair Accessible Entrance")), icon="🚪"),
+        optional_field("Wheelchair Accessible Parking Lot", to_tri_state(row.get("Wheelchair Accessible Parking Lot")), icon="🅿️"),
+        optional_field("Wheelchair Accessible Restroom", to_tri_state(row.get("Wheelchair Accessible Restroom")), icon="🚻"),
+        optional_field("Wheelchair Accessible Seating", to_tri_state(row.get("Wheelchair Accessible Seating")), icon="🪑"),
+        optional_field("Sensory Sensitivity (Quiet)", to_tri_state(row.get("Sensory Sensitivity (Quiet)")), icon="🤫"),
+        optional_field("Sensory Sensitivity (Loud)", to_tri_state(row.get("Sensory Sensitivity (Loud)")), icon="🔊"),
+        optional_field("Family-Friendly", to_tri_state(row.get("Family-Friendly")), icon="👨‍👩‍👧"),
+        optional_field("LGBTQ+ Friendly (Likely)", to_tri_state(row.get("LGBTQ+ Friendly (Likely)")), icon="🏳️‍🌈"),
+    ]
+    additional_info_fields = [f for f in additional_info_fields if f is not None]
 
     if edit_mode:
         action_buttons = html.Div(
@@ -1354,7 +1462,7 @@ def _build_modal_content(business_name, row, edit_mode=False):
 
         _category_card("Business Contact", "📇", contact_fields),
         _category_card("Business Specs", "📋", specs_fields),
-        _category_card("Accessibility", "🤝", accessibility_fields),
+        *([_category_card("Additional Information", "ℹ️", additional_info_fields)] if additional_info_fields else []),
 
         html.Hr(style={"border": "none", "borderTop": "1px solid #EEEEEE", "margin": "20px 0"}),
 
