@@ -10,6 +10,8 @@ from dash.exceptions import PreventUpdate
 from dash import no_update
 from flask import Response, has_request_context, request, session
 
+from industry_map import derive_industry
+
 
 # ── Local environment and access protection ─────────────────────────────────
 def load_local_env():
@@ -109,6 +111,10 @@ required_columns = [
 missing = [c for c in required_columns if c not in businesses.columns]
 if missing:
     raise ValueError("Missing columns: " + ", ".join(missing))
+
+_placeholder_industry = {"", "hospitality", "retail"}
+_needs_industry = businesses["Industry"].astype(str).str.strip().str.lower().isin(_placeholder_industry)
+businesses.loc[_needs_industry, "Industry"] = businesses.loc[_needs_industry, "Category"].apply(derive_industry)
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def make_options(values):
@@ -362,6 +368,7 @@ app.index_string = """
             text-decoration: none;
             font-weight: bold;
             font-size: 13px;
+            line-height: 1;
             transition: transform 0.1s, box-shadow 0.1s;
         }
         .dash-table-container a:hover {
@@ -394,6 +401,9 @@ app.index_string = """
         .dash-spreadsheet-container td[data-dash-column="Website"] > div {
             justify-content: center;
             align-items: center;
+        }
+        .dash-spreadsheet-container td[data-dash-column="Website"] > div p {
+            margin: 0;
         }
         .dash-spreadsheet-container td[data-dash-column="Website"] > div:not(:has(a))::before {
             content: "No Website";
