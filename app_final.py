@@ -5,6 +5,7 @@ import os
 import secrets
 from datetime import datetime
 import pandas as pd
+from sqlalchemy import create_engine
 from dash import Dash, Input, Output, State, dash_table, dcc, html, ctx, ALL, MATCH
 from dash.exceptions import PreventUpdate
 from dash import no_update
@@ -32,6 +33,11 @@ def load_local_env():
 load_local_env()
 ACCESS_PASSWORD = os.getenv("DASH_ACCESS_PASSWORD")
 SESSION_SECRET = os.getenv("DASH_SESSION_SECRET") or secrets.token_urlsafe(32)
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is not set. Add it to the local .env file."
+    )
 
 if not ACCESS_PASSWORD:
     raise RuntimeError(
@@ -83,7 +89,20 @@ def encode_logo(path):
 logo_src = encode_logo(LOGO_FILE)
 
 # ── Load CSV ─────────────────────────────────────────────────────────────────
-businesses = pd.read_csv(DATA_FILE, encoding="utf-8-sig")
+# businesses = pd.read_csv(DATA_FILE, encoding="utf-8-sig")
+
+# ── Load business data from PostgreSQL ───────────────────────────────────────
+engine = create_engine(DATABASE_URL)
+
+businesses = pd.read_sql(
+    'SELECT * FROM public.businesses',
+    engine
+)
+
+# id is used by the database but is not required by the current dashboard logic
+if "id" in businesses.columns:
+    businesses = businesses.drop(columns=["id"])
+
 businesses.columns = businesses.columns.str.strip()
 businesses = businesses.replace({"(blank)": "", "blank": ""}).fillna("")
 
