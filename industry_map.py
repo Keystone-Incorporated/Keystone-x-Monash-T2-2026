@@ -1,3 +1,6 @@
+import re
+
+
 INDUSTRY_MAP = {
     "car_dealer": "Automotive",
     "car_rental": "Automotive",
@@ -466,9 +469,70 @@ INDUSTRY_MAP = {
 }
 
 
-def normalize_type(value):
-    return str(value).strip().lower().replace(" ", "_").replace("-", "_")
+def normalize(value):
+    text = str(value).strip().lower()
+    text = re.sub(r"[()\.,]", " ", text)
+    text = text.replace("&", " and ")
+    text = text.replace("-", " ")
+    text = text.replace("/", " ")
+    return " ".join(text.split())
+
+
+def to_key(text):
+    return text.replace(" ", "_")
+
+
+KEYWORD_SECTORS = [
+    ("dealer", "Automotive"), ("mechanic", "Automotive"),
+    ("restaurant", "Food & drink"), ("takeaway", "Food & drink"),
+    ("takeout", "Food & drink"), ("cafe", "Food & drink"),
+    ("bar", "Food & drink"), ("tiffin", "Food & drink"),
+    ("caterer", "Food & drink"), ("catering", "Food & drink"),
+    ("kitchen", "Food & drink"), ("distillery", "Food & drink"),
+    ("store", "Shopping"), ("shop", "Shopping"),
+    ("wholesaler", "Business & manufacturing"), ("wholesale", "Business & manufacturing"),
+    ("supplier", "Business & manufacturing"), ("distributor", "Business & manufacturing"),
+    ("manufacturer", "Business & manufacturing"), ("processor", "Business & manufacturing"),
+    ("printer", "Business & manufacturing"),
+    ("school", "Education"), ("education", "Education"),
+    ("training", "Education"), ("college", "Education"),
+    ("club", "Entertainment & recreation"), ("event", "Entertainment & recreation"),
+    ("tour", "Entertainment & recreation"),
+    ("consultant", "Services"), ("consulting", "Services"), ("agency", "Services"),
+    ("service", "Services"), ("services", "Services"), ("organization", "Services"),
+    ("charity", "Services"), ("broker", "Services"), ("cleaner", "Services"),
+    ("cleaners", "Services"), ("cleaning", "Services"), ("storage", "Services"),
+    ("recruiter", "Services"), ("contractor", "Services"), ("remodeler", "Services"),
+    ("designer", "Services"), ("fitter", "Services"),
+    ("care", "Health & wellness"), ("nursing", "Health & wellness"),
+    ("optometrist", "Health & wellness"),
+    ("housing", "Housing"),
+    ("accommodation", "Lodging"), ("lodging", "Lodging"),
+    ("architect", "Services"), ("engineer", "Services"), ("builder", "Services"),
+    ("hairdresser", "Services"), ("jeweler", "Shopping"), ("jeweller", "Shopping"),
+    ("photographer", "Services"), ("photography", "Services"),
+]
+KEYWORD_SECTORS.sort(key=lambda pair: len(pair[0]), reverse=True)
 
 
 def derive_industry(category_value):
-    return INDUSTRY_MAP.get(normalize_type(category_value), "Other")
+    norm = normalize(category_value)
+    key = to_key(norm)
+    if key in INDUSTRY_MAP:
+        return INDUSTRY_MAP[key]
+
+    words = set(norm.split())
+    for phrase, sector in KEYWORD_SECTORS:
+        if " " in phrase:
+            if phrase in norm:
+                return sector
+        else:
+            if phrase in words:
+                return sector
+
+    for map_key, sector in INDUSTRY_MAP.items():
+        map_phrase = map_key.replace("_", " ")
+        if map_phrase in norm and len(map_phrase) > 4:
+            return sector
+
+    return "Other"
