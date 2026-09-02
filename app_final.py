@@ -135,7 +135,7 @@ if missing:
     raise ValueError("Missing columns: " + ", ".join(missing))
 
 # Apply industry mapping from app_final_rakan logic
-_placeholder_industry = {"", "hospitality", "retail"}
+_placeholder_industry = {"", "hospitality", "retail", "other"}
 _needs_industry = businesses["Industry"].astype(str).str.strip().str.lower().isin(_placeholder_industry)
 businesses.loc[_needs_industry, "Industry"] = businesses.loc[_needs_industry, "Category"].apply(derive_industry)
 
