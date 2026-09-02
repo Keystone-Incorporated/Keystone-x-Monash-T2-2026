@@ -3,17 +3,22 @@ import json
 import base64
 import os
 import secrets
+import threading
 from datetime import datetime
+from functools import lru_cache
 import pandas as pd
+import numpy as np
 from dash import Dash, Input, Output, State, dash_table, dcc, html, ctx, ALL, MATCH
 from dash.exceptions import PreventUpdate
 from dash import no_update
 from flask import Response, has_request_context, request, session
 
+# ── Industry Map Import ───────────────────────────────────────────────────────
+from industry_map import derive_industry
+
 
 # ── Local environment and access protection ─────────────────────────────────
 def load_local_env():
-    """Load simple KEY=VALUE settings from the ignored local .env file."""
     env_file = Path(__file__).with_name(".env")
     if not env_file.exists():
         return
@@ -45,20 +50,33 @@ FAVOURITES_FILE = DATA_FILE.with_name("favourites.json")
 COMMENTS_FILE = DATA_FILE.with_name("comments.json")
 LOGO_FILE = DATA_FILE.with_name("Keystone Logo (small).png")
 
-# ── Persistence helpers ──────────────────────────────────────────────────────
+# ── Persistence helpers with Async Writes ────────────────────────────────────
+_FAV_SET = set()
+_CSV_LOCK = threading.Lock()
+
 def load_favourites():
+    global _FAV_SET
     if FAVOURITES_FILE.exists():
         try:
             with open(FAVOURITES_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f))
+                _FAV_SET = set(json.load(f))
+                return _FAV_SET
         except Exception:
-            return set()
-    return set()
+            _FAV_SET = set()
+            return _FAV_SET
+    _FAV_SET = set()
+    return _FAV_SET
+
+def _async_save_favourites(favs_list):
+    with open(FAVOURITES_FILE, "w", encoding="utf-8") as f:
+        json.dump(favs_list, f, indent=2)
 
 def save_favourites(favs):
-    with open(FAVOURITES_FILE, "w", encoding="utf-8") as f:
-        json.dump(sorted(list(favs)), f, indent=2)
+    global _FAV_SET
+    _FAV_SET = set(favs)
+    threading.Thread(target=_async_save_favourites, args=(sorted(list(_FAV_SET)),), daemon=True).start()
 
+@lru_cache(maxsize=1)
 def load_comments():
     if COMMENTS_FILE.exists():
         try:
@@ -68,9 +86,19 @@ def load_comments():
             return {}
     return {}
 
-def save_comments(comments):
+def _async_save_comments(comments):
     with open(COMMENTS_FILE, "w", encoding="utf-8") as f:
         json.dump(comments, f, indent=2, ensure_ascii=False)
+
+def save_comments(comments):
+    threading.Thread(target=_async_save_comments, args=(comments,), daemon=True).start()
+    load_comments.cache_clear()
+
+def _async_save_csv(df_copy):
+    with _CSV_LOCK:
+        df_copy.drop(columns=["_search_name", "_is_fav"], errors="ignore").to_csv(
+            DATA_FILE, index=False, encoding="utf-8-sig"
+        )
 
 # ── Logo helper ──────────────────────────────────────────────────────────────
 def encode_logo(path):
@@ -82,21 +110,17 @@ def encode_logo(path):
 
 logo_src = encode_logo(LOGO_FILE)
 
-# ── Load CSV ─────────────────────────────────────────────────────────────────
+# ── Load CSV & Data Processing ───────────────────────────────────────────────
 businesses = pd.read_csv(DATA_FILE, encoding="utf-8-sig")
 businesses.columns = businesses.columns.str.strip()
 businesses = businesses.replace({"(blank)": "", "blank": ""}).fillna("")
 
 # Exclude permanently closed businesses
-businesses = businesses[businesses["Permanently Closed"].astype(str).str.lower() != "true"]
+businesses = businesses[businesses["Permanently Closed"].astype(str).str.lower() != "true"].reset_index(drop=True)
 
-# Ensure numeric columns are numeric
 for col in ["Reviews Count", "Total Score"]:
     if col in businesses.columns:
         businesses[col] = pd.to_numeric(businesses[col], errors="coerce")
-
-if "Favourite" not in businesses.columns:
-    businesses["Favourite"] = "No"
 
 required_columns = [
     "Business Name", "Phone", "Email", "Website", "Address",
@@ -110,18 +134,93 @@ missing = [c for c in required_columns if c not in businesses.columns]
 if missing:
     raise ValueError("Missing columns: " + ", ".join(missing))
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-def make_options(values):
-    clean = sorted({str(v).strip() for v in values if str(v).strip()})
-    return [{"label": v, "value": v} for v in clean]
+# Apply industry mapping from app_final_rakan logic
+_placeholder_industry = {"", "hospitality", "retail"}
+_needs_industry = businesses["Industry"].astype(str).str.strip().str.lower().isin(_placeholder_industry)
+businesses.loc[_needs_industry, "Industry"] = businesses.loc[_needs_industry, "Category"].apply(derive_industry)
 
-ACCESSIBILITY_FEATURES = [
-    "Assistive Hearing Loop",
+businesses["_search_name"] = businesses["Business Name"].astype(str).str.lower()
+fav_initial_set = load_favourites()
+businesses["_is_fav"] = businesses["Business Name"].isin(fav_initial_set)
+
+# Helper function to parse boolean flags safely
+def parse_bool(val):
+    if pd.isna(val) or val is None:
+        return None
+    s = str(val).strip().lower()
+    if s in ["true", "1", "yes"]:
+        return True
+    if s in ["false", "0", "no"]:
+        return False
+    return None
+
+# Parse primary boolean columns
+WHEELCHAIR_COLS = [
     "Wheelchair Accessible Entrance",
     "Wheelchair Accessible Parking Lot",
     "Wheelchair Accessible Restroom",
     "Wheelchair Accessible Seating",
 ]
+
+# Compute aggregated columns if not explicitly provided or derive logic
+for c in WHEELCHAIR_COLS + ["Assistive Hearing Loop", "Wheelchair Accessible (Likely)", 
+                            "Sensory Sensitivity (Quiet)", "Sensory Sensitivity (Loud)", 
+                            "Family-Friendly", "LGBTQ+ Friendly (Likely)"]:
+    if c not in businesses.columns:
+        businesses[c] = None
+
+# Derive Wheelchair Accessible (Likely)
+def get_wheelchair_likely(row):
+    vals = [parse_bool(row[c]) for c in WHEELCHAIR_COLS]
+    if any(v is True for v in vals):
+        return True
+    if all(v is False for v in vals if v is not None) and any(v is False for v in vals):
+        return False
+    return None
+
+w_likely = businesses.apply(get_wheelchair_likely, axis=1)
+businesses["Wheelchair Accessible (Likely)"] = businesses["Wheelchair Accessible (Likely)"].apply(parse_bool).combine_first(w_likely)
+
+# Handle Quiet & Loud Sensory Sensitivity
+if "Quiet" in businesses.columns:
+    businesses["Sensory Sensitivity (Quiet)"] = businesses["Quiet"].apply(parse_bool)
+
+loud_raw_cols = [c for c in ["Dancing", "Karaoke", "Live-Music", "Live-Performances", "Dancing", "Karaoke", "Live Music", "Live Performances"] if c in businesses.columns]
+if loud_raw_cols:
+    def get_loud(row):
+        vals = [parse_bool(row[c]) for c in loud_raw_cols]
+        return True if any(v is True for v in vals) else None
+    businesses["Sensory Sensitivity (Loud)"] = businesses["Sensory Sensitivity (Loud)"].apply(parse_bool).combine_first(businesses.apply(get_loud, axis=1))
+
+# Handle Family-Friendly
+ff_raw_cols = [c for c in ["Good For Kids", "Good For Kids Birthday", "Has Changing Table(S)", "Has Changing Table", 
+                          "Highchairs", "Kid-Friendly activities", "Kid's Menu", "Kids Menu", "Nursing Room", "Playground"] if c in businesses.columns]
+if ff_raw_cols:
+    def get_ff(row):
+        vals = [parse_bool(row[c]) for c in ff_raw_cols]
+        return True if any(v is True for v in vals) else None
+    businesses["Family-Friendly"] = businesses["Family-Friendly"].apply(parse_bool).combine_first(businesses.apply(get_ff, axis=1))
+
+# Handle LGBTQ+ Friendly (Likely)
+lgbt_raw_cols = [c for c in ["Transgender Safe Space", "Gender-Neutral Toilets", "LGBTQ+ Friendly"] if c in businesses.columns]
+if lgbt_raw_cols:
+    def get_lgbt(row):
+        safe_space = parse_bool(row.get("Transgender Safe Space"))
+        lgbt_friendly = parse_bool(row.get("LGBTQ+ Friendly"))
+        if safe_space is True or lgbt_friendly is True or parse_bool(row.get("Gender-Neutral Toilets")) is True:
+            return True
+        if safe_space is False or lgbt_friendly is False:
+            return False
+        return None
+    businesses["LGBTQ+ Friendly (Likely)"] = businesses["LGBTQ+ Friendly (Likely)"].apply(parse_bool).combine_first(businesses.apply(get_lgbt, axis=1))
+
+for cat_col in ["Industry", "Category", "Suburb"]:
+    businesses[cat_col] = businesses[cat_col].astype("category")
+
+# ── Filter Options Configuration ─────────────────────────────────────────────
+def make_options(values):
+    clean = sorted({str(v).strip() for v in values if str(v).strip()})
+    return [{"label": v, "value": v} for v in clean]
 
 REVIEW_COUNT_OPTIONS = [
     {"label": "Less than 50", "value": "Less than 50"},
@@ -129,70 +228,65 @@ REVIEW_COUNT_OPTIONS = [
     {"label": "200+", "value": "200+"},
 ]
 
-ACCESSIBILITY_OPTIONS = [{"label": f, "value": f} for f in ACCESSIBILITY_FEATURES]
+ADVANCED_OPTIONS_FEATURES = [
+    "Assistive Hearing Loop",
+    "Wheelchair Accessible (Likely)",
+    "Sensory Sensitivity (Quiet)",
+    "Sensory Sensitivity (Loud)",
+    "Family-Friendly",
+    "LGBTQ+ Friendly (Likely)",
+]
 
-INDUSTRY_OPTIONS = make_options(businesses["Industry"])
-CATEGORY_OPTIONS = make_options(businesses["Category"])
-SUBURB_OPTIONS = make_options(businesses["Suburb"])
+ADVANCED_OPTIONS = [{"label": f, "value": f} for f in ADVANCED_OPTIONS_FEATURES]
+INDUSTRY_OPTIONS = make_options(businesses["Industry"].cat.categories)
+CATEGORY_OPTIONS = make_options(businesses["Category"].cat.categories)
+SUBURB_OPTIONS = make_options(businesses["Suburb"].cat.categories)
 
 
-def apply_filters(
-    data,
-    search=None,
-    industry=None,
-    category=None,
-    suburb=None,
-    accessibility=None,
-    review_count=None,
-    favourites_only=None,
-    fav_set=None,
-    ignore=None,
-):
-    filtered = data.copy()
-    ignore = ignore or set()
-
-    if search and "search" not in ignore:
-        filtered = filtered[
-            filtered["Business Name"]
-            .astype(str)
-            .str.contains(search.strip(), case=False, na=False, regex=False)
-        ]
-    if industry and "industry" not in ignore:
-        filtered = filtered[filtered["Industry"].isin(industry)]
-    if category and "category" not in ignore:
-        filtered = filtered[filtered["Category"].isin(category)]
-    if suburb and "suburb" not in ignore:
-        filtered = filtered[filtered["Suburb"].isin(suburb)]
-    if accessibility and "accessibility" not in ignore:
+def get_filter_masks(data, search=None, industry=None, category=None, suburb=None, accessibility=None, review_count=None, favourites_only=None):
+    masks = {}
+    masks["search"] = data["_search_name"].str.contains(search.strip().lower(), regex=False) if search else np.ones(len(data), dtype=bool)
+    masks["industry"] = data["Industry"].isin(industry) if industry else np.ones(len(data), dtype=bool)
+    masks["category"] = data["Category"].isin(category) if category else np.ones(len(data), dtype=bool)
+    masks["suburb"] = data["Suburb"].isin(suburb) if suburb else np.ones(len(data), dtype=bool)
+    
+    if accessibility:
+        acc_mask = np.ones(len(data), dtype=bool)
         for feature in accessibility:
-            if feature in filtered.columns:
-                filtered = filtered[filtered[feature] == True]
-    if review_count and "review_count" not in ignore:
-        masks = []
+            if feature in data.columns:
+                acc_mask &= (data[feature].apply(parse_bool) == True)
+        masks["accessibility"] = acc_mask
+    else:
+        masks["accessibility"] = np.ones(len(data), dtype=bool)
+
+    if review_count:
+        rc_masks = []
+        counts = data["Reviews Count"]
         if "Less than 50" in review_count:
-            masks.append(filtered["Reviews Count"] < 50)
+            rc_masks.append(counts < 50)
         if "50-200" in review_count:
-            masks.append(
-                (filtered["Reviews Count"] >= 50) &
-                (filtered["Reviews Count"] <= 200)
-            )
+            rc_masks.append((counts >= 50) & (counts <= 200))
         if "200+" in review_count:
-            masks.append(filtered["Reviews Count"] > 200)
-        if masks:
-            combined = masks[0]
-            for m in masks[1:]:
-                combined = combined | m
-            filtered = filtered[combined]
-    if favourites_only and "favourites" not in ignore and fav_set is not None:
-        filtered = filtered[filtered["Business Name"].isin(fav_set)]
-    return filtered
+            rc_masks.append(counts > 200)
+        if rc_masks:
+            combined = rc_masks[0]
+            for m in rc_masks[1:]:
+                combined |= m
+            masks["review_count"] = combined
+        else:
+            masks["review_count"] = np.ones(len(data), dtype=bool)
+    else:
+        masks["review_count"] = np.ones(len(data), dtype=bool)
+
+    masks["favourites"] = (data["_is_fav"] == True) if favourites_only else np.ones(len(data), dtype=bool)
+    return masks
 
 
 def compute_accessibility_options(data):
     opts = []
-    for feature in ACCESSIBILITY_FEATURES:
-        if feature in data.columns and bool((data[feature] == True).any()):
-            opts.append({"label": feature, "value": feature})
+    for f in ADVANCED_OPTIONS_FEATURES:
+        if f in data.columns and (data[f].apply(parse_bool) == True).any():
+            opts.append({"label": f, "value": f})
     return opts
 
 
@@ -207,7 +301,6 @@ def compute_review_count_options(data):
         opts.append({"label": "200+", "value": "200+"})
     return opts
 
-
 def multi_filter(name, placeholder, options=None):
     options = options or []
     return html.Div(
@@ -218,60 +311,27 @@ def multi_filter(name, placeholder, options=None):
                 className="msf-toggle",
                 n_clicks=0,
                 children=[
-                    html.Span(
-                        placeholder,
-                        id={"type": "msf-label", "index": name},
-                        className="msf-label",
-                    ),
-                    html.Span(
-                        "▾",
-                        id={"type": "msf-chevron", "index": name},
-                        className="msf-chevron",
-                    ),
+                    html.Span(placeholder, id={"type": "msf-label", "index": name}, className="msf-label"),
+                    html.Span("▾", id={"type": "msf-chevron", "index": name}, className="msf-chevron"),
                 ],
             ),
             html.Button(
-                "✕",
-                id={"type": "msf-clear", "index": name},
-                className="msf-clear",
-                n_clicks=0,
-                title="Clear selection",
-                style={"display": "none"},
+                "✕", id={"type": "msf-clear", "index": name}, className="msf-clear", n_clicks=0, title="Clear selection", style={"display": "none"},
             ),
             html.Div(
                 id={"type": "msf-panel", "index": name},
                 className="msf-panel",
                 style={"display": "none"},
                 children=[
-                    dcc.Input(
-                        id={"type": "msf-search", "index": name},
-                        className="msf-search",
-                        type="text",
-                        placeholder="Search",
-                    ),
+                    dcc.Input(id={"type": "msf-search", "index": name}, className="msf-search", type="text", placeholder="Search"),
                     html.Div(
                         className="msf-actions",
                         children=[
-                            html.Button(
-                                "Select All",
-                                id={"type": "msf-all", "index": name},
-                                className="msf-action",
-                                n_clicks=0,
-                            ),
-                            html.Button(
-                                "Deselect All",
-                                id={"type": "msf-none", "index": name},
-                                className="msf-action",
-                                n_clicks=0,
-                            ),
+                            html.Button("Select All", id={"type": "msf-all", "index": name}, className="msf-action", n_clicks=0),
+                            html.Button("Deselect All", id={"type": "msf-none", "index": name}, className="msf-action", n_clicks=0),
                         ],
                     ),
-                    dcc.Checklist(
-                        id={"type": "msf-checklist", "index": name},
-                        className="msf-checklist",
-                        options=options,
-                        value=[],
-                    ),
+                    dcc.Checklist(id={"type": "msf-checklist", "index": name}, className="msf-checklist", options=options, value=[]),
                 ],
             ),
             dcc.Store(id={"type": "msf-store", "index": name}, data=options),
@@ -289,11 +349,7 @@ def favourites_toggle():
                 className="msf-toggle",
                 n_clicks=0,
                 children=[
-                    html.Span(
-                        "⭐ Favourites only",
-                        id="favourites-toggle-label",
-                        className="msf-label",
-                    ),
+                    html.Span("⭐ Favourites only", id="favourites-toggle-label", className="msf-label"),
                     html.Span("☆", id="favourites-toggle-icon", className="msf-chevron"),
                 ],
             ),
@@ -309,28 +365,17 @@ app.title = "Keystone Employer Database"
 server = app.server
 server.secret_key = SESSION_SECRET
 
-
-PUBLIC_PATHS = {
-    "/",
-    "/_dash-layout",
-    "/_dash-dependencies",
-    "/_dash-config",
-    "/_favicon.ico",
-}
-
+PUBLIC_PATHS = {"/", "/_dash-layout", "/_dash-dependencies", "/_dash-config", "/_favicon.ico"}
 
 def _is_login_callback():
     if request.path != "/_dash-update-component" or request.method != "POST":
         return False
-
     payload = request.get_json(silent=True) or {}
     output = str(payload.get("output", ""))
     if "auth-session" in output:
         return True
-
     outputs = payload.get("outputs") or []
     return any("auth-session" in str(item) for item in outputs)
-
 
 @app.server.before_request
 def protect_dashboard():
@@ -343,7 +388,6 @@ def protect_dashboard():
         or session.get("authenticated") is True
     ):
         return None
-
     return Response("Authentication required.", 401)
 
 app.index_string = """
@@ -354,193 +398,64 @@ app.index_string = """
         html, body, #react-entry-point { margin: 0; min-height: 100%; background: #4200A8; }
         * { box-sizing: border-box; }
         .dash-table-container a {
-            display: inline-block;
-            background: #66F2E3;
-            color: #2E1654;
-            padding: 6px 14px;
-            border-radius: 20px;
-            text-decoration: none;
-            font-weight: bold;
-            font-size: 13px;
-            transition: transform 0.1s, box-shadow 0.1s;
+            display: inline-flex; align-items: center; justify-content: center;
+            background: #66F2E3; color: #2E1654; padding: 6px 14px;
+            border-radius: 20px; text-decoration: none; font-weight: bold;
+            font-size: 13px; transition: transform 0.1s, box-shadow 0.1s;
+            vertical-align: middle; line-height: 1;
         }
-        .dash-table-container a:hover {
-            transform: translateY(-1px);
-            box-shadow: 0 4px 8px rgba(0,0,0,0.15);
-        }
-        .dash-spreadsheet-menu {
-            display: none !important;
-        }
-        .dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner td {
-            cursor: pointer;
-        }
+        .dash-table-container a:hover { transform: translateY(-1px); box-shadow: 0 4px 8px rgba(0,0,0,0.15); }
+        .dash-spreadsheet-menu { display: none !important; }
+        .dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner td { cursor: pointer; }
         .dash-spreadsheet-container .dash-spreadsheet-inner td.focused,
         .dash-spreadsheet-container .dash-spreadsheet-inner td.cell--selected,
         .dash-spreadsheet-container .dash-spreadsheet-inner td:active {
-            border: 1px solid #EEEEEE !important;
-            box-shadow: none !important;
-            outline: none !important;
-            background-color: transparent !important;
+            border: 1px solid #EEEEEE !important; box-shadow: none !important; outline: none !important; background-color: transparent !important;
         }
-        .dash-spreadsheet-container .dash-spreadsheet-inner td {
-            height: 50px !important;
-            min-height: 50px !important;
-        }
-        .dash-spreadsheet-container .dash-spreadsheet-inner td > div {
-            min-height: 50px !important;
-            display: flex;
-            align-items: center;
-        }
-        .dash-spreadsheet-container td[data-dash-column="Website"] > div {
-            justify-content: center;
-            align-items: center;
-        }
+        .dash-spreadsheet-container .dash-spreadsheet-inner td { height: 50px !important; min-height: 50px !important; }
+        .dash-spreadsheet-container .dash-spreadsheet-inner td > div { min-height: 50px !important; display: flex; align-items: center; }
+        .dash-spreadsheet-container td[data-dash-column="Website"] > div { justify-content: center; align-items: center; }
         .dash-spreadsheet-container td[data-dash-column="Website"] > div:not(:has(a))::before {
-            content: "No Website";
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            background: #FF8C00;
-            color: white;
-            padding: 6px 14px;
-            border-radius: 20px;
-            font-weight: bold;
-            font-size: 13px;
-            font-family: Arial, sans-serif;
-            pointer-events: none;
-            white-space: nowrap;
-            line-height: 1;
+            content: "No Website"; display: inline-flex; align-items: center; justify-content: center;
+            background: #FF8C00; color: white; padding: 6px 14px; border-radius: 20px;
+            font-weight: bold; font-size: 13px; font-family: Arial, sans-serif; pointer-events: none;
+            white-space: nowrap; vertical-align: middle; line-height: 1;
         }
         .modal-overlay {
-            position: fixed;
-            top: 0; left: 0; right: 0; bottom: 0;
-            background: rgba(0,0,0,0.6);
-            z-index: 1000;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6);
+            z-index: 1000; display: flex; align-items: center; justify-content: center; padding: 20px;
         }
         .modal-card {
-            background: white;
-            border-radius: 20px;
-            max-width: 800px;
-            width: 100%;
-            max-height: 90vh;
-            overflow: hidden;
-            display: flex;
-            flex-direction: column;
-            box-shadow: 0 20px 50px rgba(0,0,0,0.3);
+            background: white; border-radius: 20px; max-width: 800px; width: 100%; max-height: 90vh;
+            overflow: hidden; display: flex; flex-direction: column; box-shadow: 0 20px 50px rgba(0,0,0,0.3);
         }
-
-        /* ── Multi-select checkbox filters ─────────────────────────────── */
         .msf { position: relative; font-family: Arial, sans-serif; }
         .msf-toggle {
-            width: 100%;
-            height: 48px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 8px;
-            background: white;
-            border: 1px solid #CCCCCC;
-            border-radius: 10px;
-            padding: 0 12px 0 14px;
-            font-size: 15px;
-            color: #2E1654;
-            cursor: pointer;
-            text-align: left;
-            font-family: Arial, sans-serif;
+            width: 100%; height: 48px; display: flex; align-items: center; justify-content: space-between;
+            gap: 8px; background: white; border: 1px solid #CCCCCC; border-radius: 10px; padding: 0 12px 0 14px;
+            font-size: 15px; color: #2E1654; cursor: pointer; text-align: left; font-family: Arial, sans-serif;
         }
         .msf-toggle:hover { border-color: #4200A8; }
-        .msf-toggle.msf-open {
-            border-color: #4200A8;
-            border-bottom-left-radius: 0;
-            border-bottom-right-radius: 0;
-        }
-        .msf-toggle.msf-toggle-selected {
-            border-color: #4200A8;
-            background: #F8F5FF;
-        }
-        .msf-label {
-            flex: 1;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-        }
+        .msf-toggle.msf-open { border-color: #4200A8; border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+        .msf-toggle.msf-toggle-selected { border-color: #4200A8; background: #F8F5FF; }
+        .msf-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .msf-label.msf-active { font-weight: bold; color: #4200A8; }
         .msf-chevron { color: #4200A8; font-size: 12px; }
-        .msf-clear {
-            position: absolute;
-            right: 30px;
-            top: 13px;
-            z-index: 2;
-            background: none;
-            border: none;
-            color: #999999;
-            cursor: pointer;
-            font-size: 13px;
-            padding: 3px 5px;
-        }
+        .msf-clear { position: absolute; right: 30px; top: 13px; z-index: 2; background: none; border: none; color: #999999; cursor: pointer; font-size: 13px; padding: 3px 5px; }
         .msf-clear:hover { color: #4200A8; }
         .msf-panel {
-            position: absolute;
-            top: 47px;
-            left: 0;
-            right: 0;
-            z-index: 100;
-            background: white;
-            border: 1px solid #4200A8;
-            border-top: none;
-            border-radius: 0 0 10px 10px;
-            box-shadow: 0 14px 28px rgba(0,0,0,0.20);
-            padding: 10px 12px 12px;
+            position: absolute; top: 47px; left: 0; right: 0; z-index: 100; background: white;
+            border: 1px solid #4200A8; border-top: none; border-radius: 0 0 10px 10px;
+            box-shadow: 0 14px 28px rgba(0,0,0,0.20); padding: 10px 12px 12px;
         }
-        .msf-search {
-            width: 100%;
-            padding: 8px 10px;
-            margin-bottom: 8px;
-            border: 1px solid #DDDDDD;
-            border-radius: 6px;
-            font-size: 14px;
-            font-family: Arial, sans-serif;
-        }
+        .msf-search { width: 100%; padding: 8px 10px; margin-bottom: 8px; border: 1px solid #DDDDDD; border-radius: 6px; font-size: 14px; font-family: Arial, sans-serif; }
         .msf-actions { display: flex; gap: 18px; margin: 0 4px 4px; }
-        .msf-action {
-            background: none;
-            border: none;
-            padding: 0;
-            cursor: pointer;
-            color: #4200A8;
-            font-weight: bold;
-            font-size: 13px;
-            font-family: Arial, sans-serif;
-        }
+        .msf-action { background: none; border: none; padding: 0; cursor: pointer; color: #4200A8; font-weight: bold; font-size: 13px; font-family: Arial, sans-serif; }
         .msf-action:hover { text-decoration: underline; }
-        .msf-checklist {
-            max-height: 220px;
-            overflow-y: auto;
-            display: flex;
-            flex-direction: column;
-        }
-        .msf-checklist label {
-            display: flex !important;
-            align-items: center;
-            gap: 10px;
-            padding: 8px 6px;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 14px;
-            color: #2E1654;
-        }
+        .msf-checklist { max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; }
+        .msf-checklist label { display: flex !important; align-items: center; gap: 10px; padding: 8px 6px; border-radius: 6px; cursor: pointer; font-size: 14px; color: #2E1654; }
         .msf-checklist label:hover { background: #F8F5FF; }
-        .msf-checklist input {
-            accent-color: #4200A8;
-            width: 16px;
-            height: 16px;
-            cursor: pointer;
-            margin: 0;
-        }
+        .msf-checklist input { accent-color: #4200A8; width: 16px; height: 16px; cursor: pointer; margin: 0; }
     </style></head>
     <body>{%app_entry%}<footer>{%config%}{%scripts%}{%renderer%}</footer>
     <script>
@@ -562,7 +477,7 @@ app.index_string = """
 dashboard_layout = html.Div(
     style={"backgroundColor": "#4200A8", "minHeight": "100vh", "fontFamily": "Arial, sans-serif", "margin": "0", "paddingBottom": "70px"},
     children=[
-        dcc.Store(id="current-business-store", storage_type="memory"),
+        dcc.Store(id="current-business-idx", storage_type="memory"),
         dcc.Store(id="fav-update-trigger", data=0),
         dcc.Store(id="comment-update-trigger", data=0),
         dcc.Store(id="edit-mode-store", data=False),
@@ -570,7 +485,6 @@ dashboard_layout = html.Div(
         dcc.Store(id="msf-active", data=None),
         html.Button(id="msf-outside-trigger", n_clicks=0, style={"display": "none"}),
 
-        # ── Header ───────────────────────────────────────────────────────────
         html.Div(
             style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "padding": "25px 45px", "borderBottom": "1px solid rgba(255,255,255,0.15)"},
             children=[
@@ -578,33 +492,13 @@ dashboard_layout = html.Div(
                 html.Div(
                     style={"display": "flex", "alignItems": "center", "gap": "16px"},
                     children=[
-                        html.A(
-                            "🌐 keystone.org.au",
-                            href="https://www.keystone.org.au/",
-                            target="_blank",
-                            style={"color": "white", "fontSize": "16px", "fontWeight": "bold", "textDecoration": "none"},
-                        ),
-                        html.Button(
-                            "Log out",
-                            id="logout-btn",
-                            n_clicks=0,
-                            style={
-                                "backgroundColor": "transparent",
-                                "color": "white",
-                                "border": "1px solid #66F2E3",
-                                "borderRadius": "20px",
-                                "padding": "8px 15px",
-                                "fontSize": "14px",
-                                "fontWeight": "bold",
-                                "cursor": "pointer",
-                            },
-                        ),
+                        html.A("🌐 keystone.org.au", href="https://www.keystone.org.au/", target="_blank", style={"color": "white", "fontSize": "16px", "fontWeight": "bold", "textDecoration": "none"}),
+                        html.Button("Log out", id="logout-btn", n_clicks=0, style={"backgroundColor": "transparent", "color": "white", "border": "1px solid #66F2E3", "borderRadius": "20px", "padding": "8px 15px", "fontSize": "14px", "fontWeight": "bold", "cursor": "pointer"}),
                     ],
                 ),
             ],
         ),
 
-        # ── Main Content ─────────────────────────────────────────────────────
         html.Div(
             style={"maxWidth": "1500px", "margin": "0 auto", "padding": "45px 30px"},
             children=[
@@ -614,40 +508,28 @@ dashboard_layout = html.Div(
                         html.Span("🔍", style={"fontSize": "36px", "lineHeight": "1"}),
                         html.Div(
                             children=[
-                                html.H2(
-                                    "Find the right businesses and opportunities",
-                                    style={"color": "white", "fontSize": "36px", "margin": "0 0 10px 0"}
-                                ),
-                                html.P(
-                                    "Search by business name and filter the available results.",
-                                    style={"color": "#D9CCFF", "fontSize": "18px", "margin": "0"}
-                                ),
+                                html.H2("Find the right businesses and opportunities", style={"color": "white", "fontSize": "36px", "margin": "0 0 10px 0"}),
+                                html.P("Search by business name and filter the available results.", style={"color": "#D9CCFF", "fontSize": "18px", "margin": "0"}),
                             ]
                         ),
                     ]
                 ),
 
-                # ── Filter Card ──────────────────────────────────────────────
                 html.Div(
                     style={"backgroundColor": "white", "borderRadius": "20px", "padding": "28px", "boxShadow": "0 12px 30px rgba(0,0,0,0.20)", "marginBottom": "30px"},
                     children=[
                         html.Label("🔍 Search businesses", style={"fontWeight": "bold", "color": "#2E1654"}),
                         dcc.Input(
-                            id="search-input", type="text", placeholder="Search by business name...",
-                            debounce=True,
+                            id="search-input", type="text", placeholder="Search by business name...", debounce=True,
                             style={"width": "100%", "padding": "14px", "marginTop": "8px", "marginBottom": "20px", "borderRadius": "10px", "border": "1px solid #CCCCCC", "fontSize": "16px", "height": "48px"},
                         ),
                         html.Div(
                             style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit, minmax(190px, 1fr))", "gap": "16px"},
                             children=[
                                 multi_filter("industry", "🏭 Industry", options=INDUSTRY_OPTIONS),
-                                html.Div(
-                                    id="category-filter-wrapper",
-                                    style={"display": "none"},
-                                    children=[multi_filter("category", "📂 Category", options=CATEGORY_OPTIONS)],
-                                ),
+                                html.Div(id="category-filter-wrapper", style={"display": "none"}, children=[multi_filter("category", "📂 Category", options=CATEGORY_OPTIONS)]),
                                 multi_filter("suburb", "📍 Suburb", options=SUBURB_OPTIONS),
-                                multi_filter("accessibility", "🤝 Accessibility", options=ACCESSIBILITY_OPTIONS),
+                                multi_filter("accessibility", "⚙️ Advanced Options", options=ADVANCED_OPTIONS),
                                 multi_filter("review_count", "💬 Review count", options=REVIEW_COUNT_OPTIONS),
                                 favourites_toggle(),
                             ],
@@ -655,7 +537,7 @@ dashboard_layout = html.Div(
                     ],
                 ),
 
-                # ── Results Table ────────────────────────────────────────────
+                # ── Results Table (Server-Side Pagination Configured) ───────
                 html.Div(
                     style={"backgroundColor": "white", "borderRadius": "20px", "padding": "28px", "boxShadow": "0 12px 30px rgba(0,0,0,0.20)"},
                     children=[
@@ -669,23 +551,22 @@ dashboard_layout = html.Div(
                                 {"name": col, "id": col, "presentation": "markdown" if col == "Website" else "input", "editable": False}
                                 for col in TABLE_COLS
                             ] + [{"name": "_row_idx", "id": "_row_idx", "editable": False}],
+                            
+                            # Server-side operations
+                            page_current=0,
                             page_size=10,
-                            sort_action="native",
+                            page_action="custom",
+                            sort_action="custom",
+                            sort_mode="single",
+                            sort_by=[],
+                            
                             markdown_options={"link_target": "_blank"},
                             style_table={"overflowX": "auto", "borderRadius": "12px"},
                             style_header={"backgroundColor": "#66F2E3", "color": "#2E1654", "fontWeight": "bold", "border": "none", "padding": "12px"},
                             style_cell={
-                                "textAlign": "left",
-                                "padding": "12px",
-                                "border": "1px solid #EEEEEE",
-                                "fontFamily": "Arial, sans-serif",
-                                "minWidth": "125px",
-                                "maxWidth": "270px",
-                                "whiteSpace": "nowrap",
-                                "overflow": "hidden",
-                                "textOverflow": "ellipsis",
-                                "height": "50px",
-                                "minHeight": "50px",
+                                "textAlign": "left", "padding": "12px", "border": "1px solid #EEEEEE", "fontFamily": "Arial, sans-serif",
+                                "minWidth": "125px", "maxWidth": "270px", "whiteSpace": "nowrap", "overflow": "hidden", "textOverflow": "ellipsis",
+                                "height": "50px", "minHeight": "50px",
                             },
                             style_cell_conditional=[
                                 {"if": {"column_id": "Website"}, "minWidth": "140px", "maxWidth": "160px", "width": "150px"},
@@ -697,46 +578,16 @@ dashboard_layout = html.Div(
             ],
         ),
 
-        # ── Modal Popup ──────────────────────────────────────────────────────
         html.Div(
-            id="modal-overlay",
-            style={"display": "none"},
-            className="modal-overlay",
+            id="modal-overlay", style={"display": "none"}, className="modal-overlay",
             children=[
                 html.Div(
                     className="modal-card",
                     children=[
-                        html.Div(
-                            style={
-                                "padding": "16px 20px 0 0",
-                                "textAlign": "right",
-                                "flexShrink": "0",
-                                "background": "white",
-                                "borderRadius": "20px 20px 0 0",
-                            },
-                            children=[
-                                html.Button(
-                                    "✕",
-                                    id="close-modal-btn",
-                                    n_clicks=0,
-                                    style={
-                                        "background": "none",
-                                        "border": "none",
-                                        "fontSize": "20px",
-                                        "cursor": "pointer",
-                                        "color": "#666",
-                                    }
-                                ),
-                            ],
+                        html.Div(style={"padding": "16px 20px 0 0", "textAlign": "right", "flexShrink": "0", "background": "white", "borderRadius": "20px 20px 0 0"},
+                            children=[html.Button("✕", id="close-modal-btn", n_clicks=0, style={"background": "none", "border": "none", "fontSize": "20px", "cursor": "pointer", "color": "#666"})]
                         ),
-                        html.Div(
-                            id="modal-content",
-                            style={
-                                "padding": "0 28px 28px 28px",
-                                "overflowY": "auto",
-                                "flex": "1 1 auto",
-                            }
-                        ),
+                        html.Div(id="modal-content", style={"padding": "0 28px 28px 28px", "overflowY": "auto", "flex": "1 1 auto"}),
                     ],
                 ),
             ],
@@ -746,138 +597,46 @@ dashboard_layout = html.Div(
 
 
 def _login_container_style(authenticated):
-    return {
-        "display": "none" if authenticated else "flex",
-        "minHeight": "100vh",
-        "backgroundColor": "#4200A8",
-        "alignItems": "center",
-        "justifyContent": "center",
-        "padding": "24px",
-    }
-
+    return {"display": "none" if authenticated else "flex", "minHeight": "100vh", "backgroundColor": "#4200A8", "alignItems": "center", "justifyContent": "center", "padding": "24px"}
 
 def _dashboard_container_style(authenticated):
     return {"display": "block" if authenticated else "none"}
 
-
 def build_login_page(authenticated=False):
     return html.Div(
-        id="login-container",
-        style=_login_container_style(authenticated),
+        id="login-container", style=_login_container_style(authenticated),
         children=[
             html.Div(
-                style={
-                    "width": "100%",
-                    "maxWidth": "460px",
-                    "backgroundColor": "white",
-                    "borderRadius": "24px",
-                    "padding": "42px",
-                    "boxShadow": "0 18px 45px rgba(0,0,0,0.28)",
-                    "textAlign": "center",
-                },
+                style={"width": "100%", "maxWidth": "460px", "backgroundColor": "white", "borderRadius": "24px", "padding": "42px", "boxShadow": "0 18px 45px rgba(0,0,0,0.28)", "textAlign": "center"},
                 children=[
-                    html.Img(
-                        src=logo_src,
-                        style={"height": "62px", "maxWidth": "100%", "marginBottom": "22px"},
-                    ) if logo_src else html.H1(
-                        "Keystone",
-                        style={"color": "#4200A8", "marginBottom": "22px"},
-                    ),
-                    html.H1(
-                        "Employer Database",
-                        style={
-                            "color": "#2E1654",
-                            "fontSize": "28px",
-                            "margin": "0 0 10px",
-                        },
-                    ),
-                    html.P(
-                        "Enter the access password to view the dashboard.",
-                        style={
-                            "color": "#6F5A8C",
-                            "fontSize": "15px",
-                            "margin": "0 0 26px",
-                        },
-                    ),
-                    dcc.Input(
-                        id="login-password",
-                        type="password",
-                        placeholder="Access password",
-                        n_submit=0,
-                        style={
-                            "width": "100%",
-                            "height": "48px",
-                            "padding": "12px 14px",
-                            "borderRadius": "10px",
-                            "border": "1px solid #CCCCCC",
-                            "fontSize": "16px",
-                            "marginBottom": "14px",
-                        },
-                    ),
-                    html.Button(
-                        "Sign in",
-                        id="login-submit-btn",
-                        n_clicks=0,
-                        style={
-                            "width": "100%",
-                            "height": "48px",
-                            "border": "none",
-                            "borderRadius": "10px",
-                            "backgroundColor": "#66F2E3",
-                            "color": "#2E1654",
-                            "fontSize": "16px",
-                            "fontWeight": "bold",
-                            "cursor": "pointer",
-                        },
-                    ),
-                    html.Div(
-                        id="login-message",
-                        style={
-                            "color": "#B42318",
-                            "fontSize": "14px",
-                            "minHeight": "22px",
-                            "marginTop": "14px",
-                        },
-                    ),
+                    html.Img(src=logo_src, style={"height": "62px", "maxWidth": "100%", "marginBottom": "22px"}) if logo_src else html.H1("Keystone", style={"color": "#4200A8", "marginBottom": "22px"}),
+                    html.H1("Employer Database", style={"color": "#2E1654", "fontSize": "28px", "margin": "0 0 10px"}),
+                    html.P("Enter the access password to view the dashboard.", style={"color": "#6F5A8C", "fontSize": "15px", "margin": "0 0 26px"}),
+                    dcc.Input(id="login-password", type="password", placeholder="Access password", n_submit=0, style={"width": "100%", "height": "48px", "padding": "12px 14px", "borderRadius": "10px", "border": "1px solid #CCCCCC", "fontSize": "16px", "marginBottom": "14px"}),
+                    html.Button("Sign in", id="login-submit-btn", n_clicks=0, style={"width": "100%", "height": "48px", "border": "none", "borderRadius": "10px", "backgroundColor": "#66F2E3", "color": "#2E1654", "fontSize": "16px", "fontWeight": "bold", "cursor": "pointer"}),
+                    html.Div(id="login-message", style={"color": "#B42318", "fontSize": "14px", "minHeight": "22px", "marginTop": "14px"}),
                 ],
             )
         ],
     )
 
-
 def serve_layout():
-    authenticated = (
-        has_request_context() and session.get("authenticated") is True
-    )
+    authenticated = has_request_context() and session.get("authenticated") is True
     return html.Div(
         style={"minHeight": "100vh", "backgroundColor": "#4200A8"},
         children=[
-            dcc.Store(
-                id="auth-session",
-                data={"authenticated": authenticated},
-                storage_type="session",
-            ),
+            dcc.Store(id="auth-session", data={"authenticated": authenticated}, storage_type="session"),
             build_login_page(authenticated),
-            html.Div(
-                id="dashboard-container",
-                style=_dashboard_container_style(authenticated),
-                children=[dashboard_layout],
-            ),
+            html.Div(id="dashboard-container", style=_dashboard_container_style(authenticated), children=[dashboard_layout]),
         ],
     )
-
 
 app.layout = serve_layout
 
 @app.callback(
-    Output("auth-session", "data"),
-    Output("login-message", "children"),
-    Output("login-password", "value"),
-    Output("login-container", "style"),
-    Output("dashboard-container", "style"),
-    Input("login-submit-btn", "n_clicks"),
-    Input("logout-btn", "n_clicks"),
-    State("login-password", "value"),
+    Output("auth-session", "data"), Output("login-message", "children"), Output("login-password", "value"),
+    Output("login-container", "style"), Output("dashboard-container", "style"),
+    Input("login-submit-btn", "n_clicks"), Input("logout-btn", "n_clicks"), State("login-password", "value"),
     prevent_initial_call=True,
 )
 def authenticate_user(n_clicks, logout_clicks, password):
@@ -885,13 +644,7 @@ def authenticate_user(n_clicks, logout_clicks, password):
         if not logout_clicks:
             raise PreventUpdate
         session.pop("authenticated", None)
-        return (
-            {"authenticated": False},
-            "",
-            "",
-            _login_container_style(False),
-            _dashboard_container_style(False),
-        )
+        return {"authenticated": False}, "", "", _login_container_style(False), _dashboard_container_style(False)
 
     if ctx.triggered_id != "login-submit-btn" or not n_clicks:
         raise PreventUpdate
@@ -899,25 +652,12 @@ def authenticate_user(n_clicks, logout_clicks, password):
     password_text = "" if password is None else str(password)
     if secrets.compare_digest(password_text, ACCESS_PASSWORD):
         session["authenticated"] = True
-        return (
-            {"authenticated": True},
-            "",
-            "",
-            _login_container_style(True),
-            _dashboard_container_style(True),
-        )
+        return {"authenticated": True}, "", "", _login_container_style(True), _dashboard_container_style(True)
 
     session.pop("authenticated", None)
-    return (
-        {"authenticated": False},
-        "Incorrect password. Please try again.",
-        "",
-        _login_container_style(False),
-        _dashboard_container_style(False),
-    )
+    return {"authenticated": False}, "Incorrect password. Please try again.", "", _login_container_style(False), _dashboard_container_style(False)
 
 
-# ── Category filter visibility (now in its own grid cell) ────────────────────
 @app.callback(
     Output("category-filter-wrapper", "style"),
     Input({"type": "msf-checklist", "index": "industry"}, "value"),
@@ -928,7 +668,6 @@ def toggle_category_wrapper(industry):
     return {"display": "none"}
 
 
-# ── Multi-select filter machinery ────────────────────────────────────────────
 @app.callback(
     Output("msf-active", "data"),
     Input({"type": "msf-toggle", "index": ALL}, "n_clicks"),
@@ -938,7 +677,6 @@ def toggle_category_wrapper(industry):
 )
 def msf_set_active(_toggle_clicks, _outside_clicks, current_active):
     trig = ctx.triggered_id
-
     if trig == "msf-outside-trigger":
         if current_active is None:
             raise PreventUpdate
@@ -1016,14 +754,10 @@ def msf_label(value, placeholder):
 
     first = str(selected[0])
     short = first if len(first) <= 12 else first[:12] + "…"
-    if len(selected) == 1:
-        text = short
-    else:
-        text = f"{short} · {len(selected)} selected"
+    text = short if len(selected) == 1 else f"{short} · {len(selected)} selected"
     return text, "msf-label msf-active", {"display": "block"}
 
 
-# ── Favourites toggle ────────────────────────────────────────────────────────
 @app.callback(
     Output("favourites-toggle-store", "data"),
     Output("favourites-toggle-btn", "className"),
@@ -1041,15 +775,19 @@ def toggle_favourites_filter(_n_clicks, current):
     return new_state, toggle_class, label_class, icon
 
 
-# ── Table update + dynamic options ───────────────────────────────────────────
+# ── Server-Side Paginated Update Callbacks ────────────────────────────────────
 @app.callback(
     Output("business-table", "data"),
+    Output("business-table", "page_count"),
     Output("result-count", "children"),
     Output({"type": "msf-store", "index": "industry"}, "data"),
     Output({"type": "msf-store", "index": "category"}, "data"),
     Output({"type": "msf-store", "index": "suburb"}, "data"),
     Output({"type": "msf-store", "index": "accessibility"}, "data"),
     Output({"type": "msf-store", "index": "review_count"}, "data"),
+    Input("business-table", "page_current"),
+    Input("business-table", "page_size"),
+    Input("business-table", "sort_by"),
     Input("search-input", "value"),
     Input({"type": "msf-checklist", "index": "industry"}, "value"),
     Input({"type": "msf-checklist", "index": "category"}, "value"),
@@ -1062,7 +800,7 @@ def toggle_favourites_filter(_n_clicks, current):
     Input("auth-session", "data"),
     Input("edit-save-trigger", "data"),
 )
-def update_table(search, industry, category, suburb, accessibility, review_count, _clear_clicks, fav_only, _trig, _auth, _edit):
+def update_table_server_side(page_current, page_size, sort_by, search, industry, category, suburb, accessibility, review_count, _clear_clicks, fav_only, _trig, _auth, _edit):
     trig = ctx.triggered_id
     if isinstance(trig, dict) and trig.get("type") == "msf-clear":
         cleared_index = trig["index"]
@@ -1080,68 +818,70 @@ def update_table(search, industry, category, suburb, accessibility, review_count
     if not industry:
         category = []
 
-    fav_set = load_favourites()
-    selected = {
-        "search": search, "industry": industry, "category": category,
-        "suburb": suburb, "accessibility": accessibility,
-        "review_count": review_count,
-        "favourites_only": fav_only, "fav_set": fav_set,
-    }
+    masks = get_filter_masks(
+        businesses, search=search, industry=industry, category=category,
+        suburb=suburb, accessibility=accessibility, review_count=review_count,
+        favourites_only=fav_only
+    )
 
-    filtered = apply_filters(businesses, **selected)
+    combined_all = masks["search"] & masks["industry"] & masks["category"] & masks["suburb"] & masks["accessibility"] & masks["review_count"] & masks["favourites"]
+    filtered = businesses[combined_all]
 
-    industry_data = apply_filters(businesses, **selected, ignore={"industry"})
-    category_data = apply_filters(businesses, **selected, ignore={"category"})
-    suburb_data = apply_filters(businesses, **selected, ignore={"suburb"})
-    accessibility_data = apply_filters(businesses, **selected, ignore={"accessibility"})
-    review_count_data = apply_filters(businesses, **selected, ignore={"review_count"})
+    # Handle Server-Side Sorting
+    if sort_by and len(sort_by) > 0:
+        col = sort_by[0]["column_id"]
+        ascending = sort_by[0]["direction"] == "asc"
+        if col in filtered.columns:
+            filtered = filtered.sort_values(by=col, ascending=ascending)
+    else:
+        filtered = filtered.sort_values(by="_is_fav", ascending=False)
 
-    filtered["_is_fav"] = filtered["Business Name"].isin(fav_set)
-    filtered = filtered.sort_values(by="_is_fav", ascending=False).drop(columns=["_is_fav"])
+    total_rows = len(filtered)
+    page_count = max(1, (total_rows + page_size - 1) // page_size)
+    
+    # Slice ONLY current page (10 rows)
+    start_idx = page_current * page_size
+    end_idx = start_idx + page_size
+    page_slice = filtered.iloc[start_idx:end_idx]
 
-    display_data = filtered.copy().reset_index().rename(columns={"index": "_row_idx"})
+    ind_mask = masks["search"] & masks["category"] & masks["suburb"] & masks["accessibility"] & masks["review_count"] & masks["favourites"]
+    cat_mask = masks["search"] & masks["industry"] & masks["suburb"] & masks["accessibility"] & masks["review_count"] & masks["favourites"]
+    sub_mask = masks["search"] & masks["industry"] & masks["category"] & masks["accessibility"] & masks["review_count"] & masks["favourites"]
+    acc_mask = masks["search"] & masks["industry"] & masks["category"] & masks["suburb"] & masks["review_count"] & masks["favourites"]
+    rev_mask = masks["search"] & masks["industry"] & masks["category"] & masks["suburb"] & masks["accessibility"] & masks["favourites"]
+
+    display_data = page_slice[TABLE_COLS].copy()
+    display_data["_row_idx"] = page_slice.index
 
     display_data["Website"] = display_data["Website"].apply(
         lambda link: f"[🌐 Website]({link})" if str(link).strip() else ""
     )
 
-    output_cols = TABLE_COLS + ["_row_idx"]
-    records = display_data[output_cols].to_dict("records")
+    records = display_data.to_dict("records")
     for rec in records:
         rec["id"] = rec["_row_idx"]
 
     return (
         records,
-        f"{len(display_data)} businesses found",
-        make_options(industry_data["Industry"]),
-        make_options(category_data["Category"]),
-        make_options(suburb_data["Suburb"]),
-        compute_accessibility_options(accessibility_data),
-        compute_review_count_options(review_count_data),
+        page_count,
+        f"{total_rows} businesses found",
+        make_options(businesses.loc[ind_mask, "Industry"].unique()),
+        make_options(businesses.loc[cat_mask, "Category"].unique()),
+        make_options(businesses.loc[sub_mask, "Suburb"].unique()),
+        compute_accessibility_options(businesses[acc_mask]),
+        compute_review_count_options(businesses[rev_mask]),
     )
 
 
-# ── Modal content builder (with edit mode) ───────────────────────────────────
+# ── Modal content builder ────────────────────────────────────────────────────
 def _detail_field(label, value, is_link=False, icon="", link_text="Open link →"):
     label_text = f"{icon} {label}" if icon else label
     if is_link and value:
         return html.Div([
             html.Strong(f"{label_text}: ", style={"color": "#2E1654"}),
             html.A(
-                link_text,
-                href=value,
-                target="_blank",
-                style={
-                    "display": "inline-block",
-                    "background": "#66F2E3",
-                    "color": "#2E1654",
-                    "padding": "6px 14px",
-                    "borderRadius": "20px",
-                    "textDecoration": "none",
-                    "fontWeight": "bold",
-                    "fontSize": "13px",
-                    "transition": "transform 0.1s, box-shadow 0.1s",
-                }
+                link_text, href=value, target="_blank",
+                style={"display": "inline-block", "background": "#66F2E3", "color": "#2E1654", "padding": "6px 14px", "borderRadius": "20px", "textDecoration": "none", "fontWeight": "bold", "fontSize": "13px"}
             )
         ], style={"marginBottom": "10px"})
     return html.Div([
@@ -1152,12 +892,7 @@ def _detail_field(label, value, is_link=False, icon="", link_text="Open link →
 
 def _category_card(title, icon, fields):
     return html.Div(
-        style={
-            "background": "#F8F5FF",
-            "borderRadius": "12px",
-            "padding": "16px",
-            "marginBottom": "16px",
-        },
+        style={"background": "#F8F5FF", "borderRadius": "12px", "padding": "16px", "marginBottom": "16px"},
         children=[
             html.H4(f"{icon} {title}", style={"color": "#2E1654", "marginTop": "0", "marginBottom": "12px", "fontSize": "16px"}),
             html.Div(fields),
@@ -1165,9 +900,9 @@ def _category_card(title, icon, fields):
     )
 
 
-def _build_modal_content(business_name, row, edit_mode=False):
-    fav_set = load_favourites()
-    is_fav = business_name in fav_set
+def _build_modal_content(row_idx, row, edit_mode=False):
+    business_name = row.get("Business Name", "")
+    is_fav = bool(row.get("_is_fav", False))
     comments_dict = load_comments()
     comments = comments_dict.get(business_name, [])
 
@@ -1177,49 +912,28 @@ def _build_modal_content(business_name, row, edit_mode=False):
             comments_children.append(
                 html.Div([
                     html.Div([
-                        html.Small(
-                            datetime.fromisoformat(c["time"]).strftime("%d %b %Y %H:%M"),
-                            style={"color": "#888", "fontSize": "12px"}
-                        ),
-                        html.Button(
-                            "🗑️",
-                            id={"type": "delete-comment-btn", "index": i},
-                            n_clicks=0,
-                            title="Delete comment",
-                            style={
-                                "background": "none",
-                                "border": "none",
-                                "cursor": "pointer",
-                                "fontSize": "16px",
-                                "padding": "0 4px",
-                            }
-                        ),
+                        html.Small(datetime.fromisoformat(c["time"]).strftime("%d %b %Y %H:%M"), style={"color": "#888", "fontSize": "12px"}),
+                        html.Button("🗑️", id={"type": "delete-comment-btn", "index": i}, n_clicks=0, title="Delete comment", style={"background": "none", "border": "none", "cursor": "pointer", "fontSize": "16px", "padding": "0 4px"}),
                     ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center"}),
                     html.P(c["text"], style={"marginTop": "4px", "color": "#333", "whiteSpace": "pre-wrap"})
                 ], style={"background": "#F8F5FF", "padding": "12px", "borderRadius": "8px", "marginBottom": "8px"})
             )
     else:
-        comments_children = html.P(
-            "💬 No comments yet. Be the first to add one!",
-            style={"color": "#888", "fontStyle": "italic"}
-        )
+        comments_children = html.P("💬 No comments yet. Be the first to add one!", style={"color": "#888", "fontStyle": "italic"})
 
     email_val = row.get("Email")
     if not email_val or str(email_val).strip() == "":
         email_val = "—"
 
-    # Contact fields
     if edit_mode:
         contact_fields = [
             html.Div([
                 html.Strong("📞 Phone: ", style={"color": "#2E1654"}),
-                dcc.Input(id="edit-phone", value=str(row.get("Phone", "")), type="text",
-                          style={"padding": "6px 10px", "borderRadius": "6px", "border": "1px solid #CCCCCC", "fontSize": "14px", "width": "200px"})
+                dcc.Input(id="edit-phone", value=str(row.get("Phone", "")), type="text", style={"padding": "6px 10px", "borderRadius": "6px", "border": "1px solid #CCCCCC", "fontSize": "14px", "width": "200px"})
             ], style={"marginBottom": "10px"}),
             html.Div([
                 html.Strong("✉️ Email: ", style={"color": "#2E1654"}),
-                dcc.Input(id="edit-email", value=str(row.get("Email", "")), type="text",
-                          style={"padding": "6px 10px", "borderRadius": "6px", "border": "1px solid #CCCCCC", "fontSize": "14px", "width": "300px"})
+                dcc.Input(id="edit-email", value=str(row.get("Email", "")), type="text", style={"padding": "6px 10px", "borderRadius": "6px", "border": "1px solid #CCCCCC", "fontSize": "14px", "width": "300px"})
             ], style={"marginBottom": "10px"}),
             _detail_field("Website", row.get("Website"), is_link=True, icon="🌐", link_text="🌐 Website"),
             _detail_field("Address", row.get("Address"), icon="📍"),
@@ -1235,29 +949,20 @@ def _build_modal_content(business_name, row, edit_mode=False):
         ]
 
     rc = row.get("Reviews Count")
-    if pd.isna(rc) or rc == "" or rc is None:
-        rc_display = "—"
-    else:
-        rc_display = str(int(float(rc)))
+    rc_display = "—" if pd.isna(rc) or rc == "" or rc is None else str(int(float(rc)))
 
     ts = row.get("Total Score")
-    if pd.isna(ts) or ts == "" or ts is None:
-        ts_display = "—"
-    else:
-        ts_display = str(ts)
+    ts_display = "—" if pd.isna(ts) or ts == "" or ts is None else str(ts)
 
-    # Specs fields
     if edit_mode:
         specs_fields = [
             html.Div([
                 html.Strong("📂 Category: ", style={"color": "#2E1654"}),
-                dcc.Input(id="edit-category", value=str(row.get("Category", "")), type="text",
-                          style={"padding": "6px 10px", "borderRadius": "6px", "border": "1px solid #CCCCCC", "fontSize": "14px", "width": "250px"})
+                dcc.Input(id="edit-category", value=str(row.get("Category", "")), type="text", style={"padding": "6px 10px", "borderRadius": "6px", "border": "1px solid #CCCCCC", "fontSize": "14px", "width": "250px"})
             ], style={"marginBottom": "10px"}),
             html.Div([
                 html.Strong("🏭 Industry: ", style={"color": "#2E1654"}),
-                dcc.Input(id="edit-industry", value=str(row.get("Industry", "")), type="text",
-                          style={"padding": "6px 10px", "borderRadius": "6px", "border": "1px solid #CCCCCC", "fontSize": "14px", "width": "250px"})
+                dcc.Input(id="edit-industry", value=str(row.get("Industry", "")), type="text", style={"padding": "6px 10px", "borderRadius": "6px", "border": "1px solid #CCCCCC", "fontSize": "14px", "width": "250px"})
             ], style={"marginBottom": "10px"}),
         ]
     else:
@@ -1276,118 +981,87 @@ def _build_modal_content(business_name, row, edit_mode=False):
         _detail_field("Rating", ts_display, icon="⭐"),
     ])
 
-    accessibility_fields = []
-    for feature in ACCESSIBILITY_FEATURES:
-        val = row.get(feature)
-        display_val = "Yes" if val == True else "—"
-        accessibility_fields.append(_detail_field(feature, display_val))
+    # ── Pop-Up Additional Information Logic ─────────────────────────────────
+    additional_info_fields = []
+
+    # 1. Individual Wheelchair Options
+    for feature in WHEELCHAIR_COLS:
+        val = parse_bool(row.get(feature))
+        if val is not None:
+            additional_info_fields.append(_detail_field(feature, "Yes" if val else "No", icon="♿"))
+
+    # 2. Assistive Hearing Loop
+    ahl_val = parse_bool(row.get("Assistive Hearing Loop"))
+    if ahl_val is not None:
+        additional_info_fields.append(_detail_field("Assistive Hearing Loop", "Yes" if ahl_val else "No", icon="🦻"))
+
+    # 3. LGBTQ+ Friendly (Likely)
+    lgbt_val = parse_bool(row.get("LGBTQ+ Friendly (Likely)"))
+    if lgbt_val is not None:
+        additional_info_fields.append(_detail_field("LGBTQ+ Friendly (Likely)", "Yes" if lgbt_val else "No", icon="🌈"))
+
+    # 4. Sensory Sensitivity (Loud)
+    loud_val = parse_bool(row.get("Sensory Sensitivity (Loud)"))
+    if loud_val is not None:
+        additional_info_fields.append(_detail_field("Sensory Sensitivity (Loud)", "Yes" if loud_val else "No", icon="🔊"))
+
+    # 5. Sensory Sensitivity (Quiet)
+    quiet_val = parse_bool(row.get("Sensory Sensitivity (Quiet)"))
+    if quiet_val is not None:
+        additional_info_fields.append(_detail_field("Sensory Sensitivity (Quiet)", "Yes" if quiet_val else "No", icon="🤫"))
+
+    # 6. Family-Friendly
+    ff_val = parse_bool(row.get("Family-Friendly"))
+    if ff_val is not None:
+        additional_info_fields.append(_detail_field("Family-Friendly", "Yes" if ff_val else "No", icon="👨‍👩‍👧‍👦"))
 
     if edit_mode:
         action_buttons = html.Div(
             style={"display": "flex", "gap": "12px", "marginBottom": "20px"},
             children=[
-                html.Button(
-                    "💾 Save changes",
-                    id="save-edit-btn",
-                    n_clicks=0,
-                    style={
-                        "background": "#66F2E3", "color": "#2E1654", "border": "none",
-                        "padding": "10px 20px", "borderRadius": "8px",
-                        "fontWeight": "bold", "cursor": "pointer", "fontSize": "14px"
-                    }
-                ),
-                html.Button(
-                    "Cancel",
-                    id="cancel-edit-btn",
-                    n_clicks=0,
-                    style={
-                        "background": "white", "color": "#2E1654", "border": "1px solid #CCCCCC",
-                        "padding": "10px 20px", "borderRadius": "8px",
-                        "fontWeight": "bold", "cursor": "pointer", "fontSize": "14px"
-                    }
-                ),
+                html.Button("💾 Save changes", id="save-edit-btn", n_clicks=0, style={"background": "#66F2E3", "color": "#2E1654", "border": "none", "padding": "10px 20px", "borderRadius": "8px", "fontWeight": "bold", "cursor": "pointer", "fontSize": "14px"}),
+                html.Button("Cancel", id="cancel-edit-btn", n_clicks=0, style={"background": "white", "color": "#2E1654", "border": "1px solid #CCCCCC", "padding": "10px 20px", "borderRadius": "8px", "fontWeight": "bold", "cursor": "pointer", "fontSize": "14px"}),
             ]
         )
     else:
         action_buttons = html.Div(
             style={"marginBottom": "20px"},
             children=[
-                html.Button(
-                    "✏️ Edit details",
-                    id="edit-details-btn",
-                    n_clicks=0,
-                    style={
-                        "background": "white", "color": "#2E1654", "border": "1px solid #4200A8",
-                        "padding": "10px 20px", "borderRadius": "8px",
-                        "fontWeight": "bold", "cursor": "pointer", "fontSize": "14px"
-                    }
-                ),
+                html.Button("✏️ Edit details", id="edit-details-btn", n_clicks=0, style={"background": "white", "color": "#2E1654", "border": "1px solid #4200A8", "padding": "10px 20px", "borderRadius": "8px", "fontWeight": "bold", "cursor": "pointer", "fontSize": "14px"}),
             ]
         )
 
     return html.Div([
         html.Div([
-            html.H2(
-                business_name,
-                style={"color": "#2E1654", "margin": "0", "fontSize": "32px", "display": "inline"}
-            ),
+            html.H2(business_name, style={"color": "#2E1654", "margin": "0", "fontSize": "32px", "display": "inline"}),
             html.Button(
-                "★" if is_fav else "☆",
-                id="fav-btn",
-                n_clicks=0,
+                "★" if is_fav else "☆", id="fav-btn", n_clicks=0,
                 title="Remove favourite" if is_fav else "Add favourite",
-                style={
-                    "background": "none",
-                    "border": "none",
-                    "fontSize": "32px",
-                    "cursor": "pointer",
-                    "color": "#FFD700" if is_fav else "#CCCCCC",
-                    "padding": "0 0 0 10px",
-                    "lineHeight": "1",
-                    "verticalAlign": "middle",
-                    "fontFamily": "Arial, sans-serif",
-                }
+                style={"background": "none", "border": "none", "fontSize": "32px", "cursor": "pointer", "color": "#FFD700" if is_fav else "#CCCCCC", "padding": "0 0 0 10px", "lineHeight": "1", "verticalAlign": "middle", "fontFamily": "Arial, sans-serif"}
             ),
         ], style={"display": "flex", "alignItems": "center", "marginBottom": "20px", "paddingRight": "40px"}),
 
         action_buttons,
-
         _category_card("Business Contact", "📇", contact_fields),
         _category_card("Business Specs", "📋", specs_fields),
-        _category_card("Accessibility", "🤝", accessibility_fields),
+        _category_card("Additional Information", "🤝", additional_info_fields if additional_info_fields else [html.Div("—")]),
 
         html.Hr(style={"border": "none", "borderTop": "1px solid #EEEEEE", "margin": "20px 0"}),
-
         html.H4("💬 Comments", style={"color": "#2E1654", "marginBottom": "12px"}),
         html.Div(comments_children, style={"marginBottom": "16px"}),
 
         dcc.Textarea(
-            id="comment-input",
-            placeholder="Write a note about this business...",
-            style={
-                "width": "100%", "height": "80px", "padding": "12px",
-                "borderRadius": "8px", "border": "1px solid #CCCCCC",
-                "fontFamily": "Arial, sans-serif", "fontSize": "14px",
-                "marginBottom": "10px", "resize": "vertical"
-            }
+            id="comment-input", placeholder="Write a note about this business...",
+            style={"width": "100%", "height": "80px", "padding": "12px", "borderRadius": "8px", "border": "1px solid #CCCCCC", "fontFamily": "Arial, sans-serif", "fontSize": "14px", "marginBottom": "10px", "resize": "vertical"}
         ),
-        html.Button(
-            "➕ Add comment",
-            id="add-comment-btn",
-            n_clicks=0,
-            style={
-                "background": "#66F2E3", "color": "#2E1654", "border": "none",
-                "padding": "10px 20px", "borderRadius": "8px",
-                "fontWeight": "bold", "cursor": "pointer", "fontSize": "14px"
-            }
-        ),
+        html.Button("➕ Add comment", id="add-comment-btn", n_clicks=0, style={"background": "#66F2E3", "color": "#2E1654", "border": "none", "padding": "10px 20px", "borderRadius": "8px", "fontWeight": "bold", "cursor": "pointer", "fontSize": "14px"}),
     ])
 
 
 @app.callback(
     Output("modal-overlay", "style"),
     Output("modal-content", "children"),
-    Output("current-business-store", "data"),
+    Output("current-business-idx", "data"),
     Output("business-table", "active_cell"),
     Input("business-table", "active_cell"),
     Input("fav-update-trigger", "data"),
@@ -1395,55 +1069,39 @@ def _build_modal_content(business_name, row, edit_mode=False):
     Input("close-modal-btn", "n_clicks"),
     Input("edit-mode-store", "data"),
     Input("edit-save-trigger", "data"),
-    State("current-business-store", "data"),
+    State("current-business-idx", "data"),
     prevent_initial_call=True,
 )
-def update_modal(active_cell, _fav, _com, close_clicks, edit_mode, _edit_save, current_business):
+def update_modal(active_cell, _fav, _com, close_clicks, edit_mode, _edit_save, current_idx):
     triggered = ctx.triggered_id
 
     if triggered == "close-modal-btn" and close_clicks:
         return {"display": "none"}, html.Div(), None, None
 
     if triggered in ("fav-update-trigger", "comment-update-trigger", "edit-save-trigger"):
-        if not current_business:
+        if current_idx is None or current_idx not in businesses.index:
             raise PreventUpdate
-        business_name = current_business
-        match = businesses[businesses["Business Name"] == business_name]
-        if match.empty:
-            raise PreventUpdate
-        row = match.iloc[0].to_dict()
-        detail = _build_modal_content(business_name, row, edit_mode=False if triggered == "edit-save-trigger" else edit_mode)
-        return {"display": "flex"}, detail, business_name, no_update
+        row = businesses.loc[current_idx].to_dict()
+        detail = _build_modal_content(current_idx, row, edit_mode=False if triggered in ("fav-update-trigger", "edit-save-trigger") else edit_mode)
+        return {"display": "flex"}, detail, current_idx, no_update
 
     if triggered == "edit-mode-store":
-        if not current_business:
+        if current_idx is None or current_idx not in businesses.index:
             raise PreventUpdate
-        business_name = current_business
-        match = businesses[businesses["Business Name"] == business_name]
-        if match.empty:
-            raise PreventUpdate
-        row = match.iloc[0].to_dict()
-        detail = _build_modal_content(business_name, row, edit_mode=edit_mode)
-        return {"display": "flex"}, detail, business_name, no_update
+        row = businesses.loc[current_idx].to_dict()
+        detail = _build_modal_content(current_idx, row, edit_mode=edit_mode)
+        return {"display": "flex"}, detail, current_idx, no_update
 
     if not active_cell:
         raise PreventUpdate
 
     orig_idx = active_cell.get("row_id")
-    if orig_idx is None:
+    if orig_idx is None or orig_idx not in businesses.index:
         raise PreventUpdate
 
-    try:
-        row = businesses.loc[orig_idx].to_dict()
-    except Exception:
-        raise PreventUpdate
-
-    business_name = row.get("Business Name")
-    if not business_name:
-        raise PreventUpdate
-
-    detail = _build_modal_content(business_name, row, edit_mode=False)
-    return {"display": "flex"}, detail, business_name, no_update
+    row = businesses.loc[orig_idx].to_dict()
+    detail = _build_modal_content(orig_idx, row, edit_mode=False)
+    return {"display": "flex"}, detail, orig_idx, no_update
 
 
 @app.callback(
@@ -1453,58 +1111,37 @@ def update_modal(active_cell, _fav, _com, close_clicks, edit_mode, _edit_save, c
     prevent_initial_call=True,
 )
 def handle_edit_mode(edit_clicks, cancel_clicks):
-    triggered = ctx.triggered_id
-
-    if triggered == "edit-details-btn":
+    trig = ctx.triggered_id
+    if trig == "edit-details-btn":
         return True
-
-    if triggered == "cancel-edit-btn":
+    if trig == "cancel-edit-btn":
         return False
-
     raise PreventUpdate
+
 
 @app.callback(
     Output("edit-save-trigger", "data"),
     Output("edit-mode-store", "data", allow_duplicate=True),
-
     Input("save-edit-btn", "n_clicks", allow_optional=True),
-
     State("edit-industry", "value", allow_optional=True),
     State("edit-category", "value", allow_optional=True),
     State("edit-phone", "value", allow_optional=True),
     State("edit-email", "value", allow_optional=True),
-    State("current-business-store", "data"),
-
+    State("current-business-idx", "data"),
     prevent_initial_call=True,
 )
-def save_business_details(
-    save_clicks,
-    industry_val,
-    category_val,
-    phone_val,
-    email_val,
-    business_name,
-):
-    if not save_clicks or not business_name:
+def save_business_details(save_clicks, industry_val, category_val, phone_val, email_val, current_idx):
+    if not save_clicks or current_idx is None or current_idx not in businesses.index:
         raise PreventUpdate
 
-    match = businesses[businesses["Business Name"] == business_name]
+    # In-memory instant updates
+    businesses.loc[current_idx, "Industry"] = str(industry_val or "").strip()
+    businesses.loc[current_idx, "Category"] = str(category_val or "").strip()
+    businesses.loc[current_idx, "Phone"] = str(phone_val or "").strip()
+    businesses.loc[current_idx, "Email"] = str(email_val or "").strip()
 
-    if match.empty:
-        raise PreventUpdate
-
-    idx = match.index[0]
-
-    businesses.loc[idx, "Industry"] = str(industry_val or "").strip()
-    businesses.loc[idx, "Category"] = str(category_val or "").strip()
-    businesses.loc[idx, "Phone"] = str(phone_val or "").strip()
-    businesses.loc[idx, "Email"] = str(email_val or "").strip()
-
-    businesses.to_csv(
-        DATA_FILE,
-        index=False,
-        encoding="utf-8-sig"
-    )
+    # Async background disk write
+    threading.Thread(target=_async_save_csv, args=(businesses.copy(),), daemon=True).start()
 
     return datetime.now().isoformat(), False
 
@@ -1512,20 +1149,24 @@ def save_business_details(
 @app.callback(
     Output("fav-update-trigger", "data"),
     Input("fav-btn", "n_clicks"),
-    State("current-business-store", "data"),
+    State("current-business-idx", "data"),
     prevent_initial_call=True,
 )
-def toggle_favourite(n_clicks, business_name):
-    if not n_clicks or not business_name:
+def toggle_favourite(n_clicks, current_idx):
+    if not n_clicks or current_idx is None or current_idx not in businesses.index:
         raise PreventUpdate
 
-    fav_set = load_favourites()
-    if business_name in fav_set:
-        fav_set.remove(business_name)
-    else:
-        fav_set.add(business_name)
-    save_favourites(fav_set)
+    fav_set = _FAV_SET
+    current_state = businesses.loc[current_idx, "_is_fav"]
+    new_state = not current_state
+    businesses.loc[current_idx, "_is_fav"] = new_state
 
+    if new_state:
+        fav_set.add(current_idx)
+    else:
+        fav_set.discard(current_idx)
+        
+    save_favourites(fav_set)
     return n_clicks
 
 
@@ -1534,14 +1175,15 @@ def toggle_favourite(n_clicks, business_name):
     Output("comment-input", "value"),
     Input("add-comment-btn", "n_clicks"),
     Input({"type": "delete-comment-btn", "index": ALL}, "n_clicks"),
-    State("current-business-store", "data"),
+    State("current-business-idx", "data"),
     State("comment-input", "value"),
     prevent_initial_call=True,
 )
-def manage_comments(add_clicks, delete_clicks_list, business_name, text):
-    if not business_name:
+def manage_comments(add_clicks, delete_clicks_list, current_idx, text):
+    if current_idx is None or current_idx not in businesses.index:
         raise PreventUpdate
 
+    business_name = businesses.loc[current_idx, "Business Name"]
     triggered_id = ctx.triggered_id
 
     if triggered_id == "add-comment-btn":
@@ -1557,12 +1199,10 @@ def manage_comments(add_clicks, delete_clicks_list, business_name, text):
             "text": text.strip(),
         })
         save_comments(comments_dict)
-
         return add_clicks, ""
 
     elif isinstance(triggered_id, dict) and triggered_id.get("type") == "delete-comment-btn":
         comment_idx = triggered_id["index"]
-
         comments_dict = load_comments()
         if business_name not in comments_dict:
             raise PreventUpdate
@@ -1579,4 +1219,4 @@ def manage_comments(add_clicks, delete_clicks_list, business_name, text):
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=8050, debug=False)
+    app.run(host="127.0.0.1", port=8055, debug=False)
