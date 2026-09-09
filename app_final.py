@@ -123,7 +123,7 @@ logo_src = encode_logo(LOGO_FILE)
 engine = create_engine(DATABASE_URL)
 
 businesses = pd.read_sql(
-    'SELECT * FROM public.businesses_200k',
+    'SELECT * FROM public.businesses',
     engine
 )
 
