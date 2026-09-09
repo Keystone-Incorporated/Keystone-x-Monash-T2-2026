@@ -8,11 +8,13 @@ from datetime import datetime
 from functools import lru_cache
 import pandas as pd
 import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.preprocessing import MinMaxScaler
+
 from dash import Dash, Input, Output, State, dash_table, dcc, html, ctx, ALL, MATCH
 from dash.exceptions import PreventUpdate
 from dash import no_update
 from flask import Response, has_request_context, request, session
-from sqlalchemy import create_engine
 
 # ── Industry Map Import ───────────────────────────────────────────────────────
 from industry_map import derive_industry
@@ -38,11 +40,6 @@ def load_local_env():
 load_local_env()
 ACCESS_PASSWORD = os.getenv("DASH_ACCESS_PASSWORD")
 SESSION_SECRET = os.getenv("DASH_SESSION_SECRET") or secrets.token_urlsafe(32)
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError(
-        "DATABASE_URL is not set. Add it to the local .env file."
-    )
 
 if not ACCESS_PASSWORD:
     raise RuntimeError(
@@ -117,44 +114,38 @@ def encode_logo(path):
 logo_src = encode_logo(LOGO_FILE)
 
 # ── Load CSV & Data Processing ───────────────────────────────────────────────
-# businesses = pd.read_csv(DATA_FILE, encoding="utf-8-sig")
-
-# ── Load business data from PostgreSQL ───────────────────────────────────────
-engine = create_engine(DATABASE_URL)
-
-businesses = pd.read_sql(
-    'SELECT * FROM public.businesses',
-    engine
-)
-
-# id is used by the database but is not required by the current dashboard logic
-if "id" in businesses.columns:
-    businesses = businesses.drop(columns=["id"])
-
+businesses = pd.read_csv(DATA_FILE, encoding="utf-8-sig")
 businesses.columns = businesses.columns.str.strip()
 businesses = businesses.replace({"(blank)": "", "blank": ""}).fillna("")
 
 # Exclude permanently closed businesses
 businesses = businesses[businesses["Permanently Closed"].astype(str).str.lower() != "true"].reset_index(drop=True)
 
-for col in ["Reviews Count", "Total Score"]:
+for col in ["Reviews Count", "Total Score", "Latitude", "Longitude"]:
     if col in businesses.columns:
         businesses[col] = pd.to_numeric(businesses[col], errors="coerce")
 
+# Title case for Council Area
+if "Council Area" in businesses.columns:
+    businesses["Council Area"] = businesses["Council Area"].astype(str).str.strip().str.title()
+else:
+    businesses["Council Area"] = ""
+
 required_columns = [
     "Business Name", "Phone", "Email", "Website", "Address",
-    "Google Maps", "Industry", "Category", "Suburb",
+    "Google Maps", "Industry", "Category", "Suburb", "Council Area",
     "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun",
     "Assistive Hearing Loop", "Wheelchair Accessible Entrance",
     "Wheelchair Accessible Parking Lot", "Wheelchair Accessible Restroom",
     "Wheelchair Accessible Seating", "Reviews Count", "Total Score",
+    "Latitude", "Longitude"
 ]
 missing = [c for c in required_columns if c not in businesses.columns]
 if missing:
     raise ValueError("Missing columns: " + ", ".join(missing))
 
-# Apply industry mapping from app_final_rakan logic
-_placeholder_industry = {"", "hospitality", "retail", "other"}
+# Apply industry mapping
+_placeholder_industry = {"", "hospitality", "retail"}
 _needs_industry = businesses["Industry"].astype(str).str.strip().str.lower().isin(_placeholder_industry)
 businesses.loc[_needs_industry, "Industry"] = businesses.loc[_needs_industry, "Category"].apply(derive_industry)
 
@@ -162,7 +153,6 @@ businesses["_search_name"] = businesses["Business Name"].astype(str).str.lower()
 fav_initial_set = load_favourites()
 businesses["_is_fav"] = businesses["Business Name"].isin(fav_initial_set)
 
-# Helper function to parse boolean flags safely
 def parse_bool(val):
     if pd.isna(val) or val is None:
         return None
@@ -173,7 +163,6 @@ def parse_bool(val):
         return False
     return None
 
-# Parse primary boolean columns
 WHEELCHAIR_COLS = [
     "Wheelchair Accessible Entrance",
     "Wheelchair Accessible Parking Lot",
@@ -181,14 +170,12 @@ WHEELCHAIR_COLS = [
     "Wheelchair Accessible Seating",
 ]
 
-# Compute aggregated columns if not explicitly provided or derive logic
 for c in WHEELCHAIR_COLS + ["Assistive Hearing Loop", "Wheelchair Accessible (Likely)", 
                             "Sensory Sensitivity (Quiet)", "Sensory Sensitivity (Loud)", 
                             "Family-Friendly", "LGBTQ+ Friendly (Likely)"]:
     if c not in businesses.columns:
         businesses[c] = None
 
-# Derive Wheelchair Accessible (Likely)
 def get_wheelchair_likely(row):
     vals = [parse_bool(row[c]) for c in WHEELCHAIR_COLS]
     if any(v is True for v in vals):
@@ -200,18 +187,16 @@ def get_wheelchair_likely(row):
 w_likely = businesses.apply(get_wheelchair_likely, axis=1)
 businesses["Wheelchair Accessible (Likely)"] = businesses["Wheelchair Accessible (Likely)"].apply(parse_bool).combine_first(w_likely)
 
-# Handle Quiet & Loud Sensory Sensitivity
 if "Quiet" in businesses.columns:
     businesses["Sensory Sensitivity (Quiet)"] = businesses["Quiet"].apply(parse_bool)
 
-loud_raw_cols = [c for c in ["Dancing", "Karaoke", "Live-Music", "Live-Performances", "Dancing", "Karaoke", "Live Music", "Live Performances"] if c in businesses.columns]
+loud_raw_cols = [c for c in ["Dancing", "Karaoke", "Live-Music", "Live-Performances", "Live Music", "Live Performances"] if c in businesses.columns]
 if loud_raw_cols:
     def get_loud(row):
         vals = [parse_bool(row[c]) for c in loud_raw_cols]
         return True if any(v is True for v in vals) else None
     businesses["Sensory Sensitivity (Loud)"] = businesses["Sensory Sensitivity (Loud)"].apply(parse_bool).combine_first(businesses.apply(get_loud, axis=1))
 
-# Handle Family-Friendly
 ff_raw_cols = [c for c in ["Good For Kids", "Good For Kids Birthday", "Has Changing Table(S)", "Has Changing Table", 
                           "Highchairs", "Kid-Friendly activities", "Kid's Menu", "Kids Menu", "Nursing Room", "Playground"] if c in businesses.columns]
 if ff_raw_cols:
@@ -220,7 +205,6 @@ if ff_raw_cols:
         return True if any(v is True for v in vals) else None
     businesses["Family-Friendly"] = businesses["Family-Friendly"].apply(parse_bool).combine_first(businesses.apply(get_ff, axis=1))
 
-# Handle LGBTQ+ Friendly (Likely)
 lgbt_raw_cols = [c for c in ["Transgender Safe Space", "Gender-Neutral Toilets", "LGBTQ+ Friendly"] if c in businesses.columns]
 if lgbt_raw_cols:
     def get_lgbt(row):
@@ -233,8 +217,62 @@ if lgbt_raw_cols:
         return None
     businesses["LGBTQ+ Friendly (Likely)"] = businesses["LGBTQ+ Friendly (Likely)"].apply(parse_bool).combine_first(businesses.apply(get_lgbt, axis=1))
 
-for cat_col in ["Industry", "Category", "Suburb"]:
+for cat_col in ["Industry", "Category", "Suburb", "Council Area"]:
     businesses[cat_col] = businesses[cat_col].astype("category")
+
+# ── Spatial Distance & Similarity Precomputation ──────────────────────────────
+def compute_geo_similarity(df):
+    """Calculates spatial similarity (0 to 1) based on physical distance in km."""
+    lats = pd.to_numeric(df["Latitude"], errors="coerce").fillna(0).values
+    lons = pd.to_numeric(df["Longitude"], errors="coerce").fillna(0).values
+    
+    rad_lats = np.radians(lats)
+    rad_lons = np.radians(lons)
+    
+    dlat = rad_lats[:, None] - rad_lats[None, :]
+    dlon = rad_lons[:, None] - rad_lons[None, :]
+    
+    a = np.sin(dlat / 2.0)**2 + np.cos(rad_lats[:, None]) * np.cos(rad_lats[None, :]) * np.sin(dlon / 2.0)**2
+    km_matrix = 6371.0 * (2 * np.arcsin(np.sqrt(a)))
+    
+    return 1.0 / (1.0 + (km_matrix / 1.0))
+
+
+def compute_similarity_matrix(df):
+    # 1. Industry (30% Weight)
+    ind_df = pd.get_dummies(df[["Industry"]].astype(str), dtype=float)
+    ind_norm = ind_df / np.sqrt(ind_df.shape[1]) if ind_df.shape[1] > 0 else ind_df
+    ind_sim = cosine_similarity(ind_norm)
+    
+    # 2. Category (30% Weight)
+    cat_df = pd.get_dummies(df[["Category"]].astype(str), dtype=float)
+    cat_norm = cat_df / np.sqrt(cat_df.shape[1]) if cat_df.shape[1] > 0 else cat_df
+    cat_sim = cosine_similarity(cat_norm)
+        
+    # 3. Geo Proximity / Location (30% Weight)
+    geo_sim = compute_geo_similarity(df)
+
+    # 4. Reviews Count (10% Weight)
+    scaler = MinMaxScaler()
+    revs = pd.to_numeric(df["Reviews Count"], errors="coerce").fillna(0).values.reshape(-1, 1)
+    rev_df = pd.DataFrame(scaler.fit_transform(revs), columns=["Reviews Count"], index=df.index)
+    rev_sim = cosine_similarity(rev_df)
+
+    # Combined matrix with requested 30/30/30/10 weights
+    return (0.30 * ind_sim) + (0.30 * cat_sim) + (0.30 * geo_sim) + (0.10 * rev_sim)
+
+SIMILARITY_MATRIX = compute_similarity_matrix(businesses)
+
+def get_top_similar(row_idx, top_n=3):
+    scores = list(enumerate(SIMILARITY_MATRIX[row_idx]))
+    scores = sorted(scores, key=lambda x: x[1], reverse=True)
+    top_items = []
+    for idx, score in scores:
+        if idx != row_idx:
+            top_items.append((idx, score))
+        if len(top_items) == top_n:
+            break
+    return top_items
 
 # ── Filter Options Configuration ─────────────────────────────────────────────
 def make_options(values):
@@ -259,14 +297,16 @@ ADVANCED_OPTIONS_FEATURES = [
 ADVANCED_OPTIONS = [{"label": f, "value": f} for f in ADVANCED_OPTIONS_FEATURES]
 INDUSTRY_OPTIONS = make_options(businesses["Industry"].cat.categories)
 CATEGORY_OPTIONS = make_options(businesses["Category"].cat.categories)
+COUNCIL_OPTIONS = make_options(businesses["Council Area"].cat.categories)
 SUBURB_OPTIONS = make_options(businesses["Suburb"].cat.categories)
 
 
-def get_filter_masks(data, search=None, industry=None, category=None, suburb=None, accessibility=None, review_count=None, favourites_only=None):
+def get_filter_masks(data, search=None, industry=None, category=None, council_area=None, suburb=None, accessibility=None, review_count=None, favourites_only=None):
     masks = {}
     masks["search"] = data["_search_name"].str.contains(search.strip().lower(), regex=False) if search else np.ones(len(data), dtype=bool)
     masks["industry"] = data["Industry"].isin(industry) if industry else np.ones(len(data), dtype=bool)
     masks["category"] = data["Category"].isin(category) if category else np.ones(len(data), dtype=bool)
+    masks["council_area"] = data["Council Area"].isin(council_area) if council_area else np.ones(len(data), dtype=bool)
     masks["suburb"] = data["Suburb"].isin(suburb) if suburb else np.ones(len(data), dtype=bool)
     
     if accessibility:
@@ -442,13 +482,14 @@ app.index_string = """
         }
         .modal-overlay {
             position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6);
-            z-index: 1000; display: flex; align-items: center; justify-content: center; padding: 20px;
+            z-index: 2000; display: flex; align-items: center; justify-content: center; padding: 20px;
         }
         .modal-card {
             background: white; border-radius: 20px; max-width: 800px; width: 100%; max-height: 90vh;
             overflow: hidden; display: flex; flex-direction: column; box-shadow: 0 20px 50px rgba(0,0,0,0.3);
+            pointer-events: auto;
         }
-        .msf { position: relative; font-family: Arial, sans-serif; }
+        .msf { position: relative; font-family: Arial, sans-serif; align-self: start; }
         .msf-toggle {
             width: 100%; height: 48px; display: flex; align-items: center; justify-content: space-between;
             gap: 8px; background: white; border: 1px solid #CCCCCC; border-radius: 10px; padding: 0 12px 0 14px;
@@ -463,9 +504,9 @@ app.index_string = """
         .msf-clear { position: absolute; right: 30px; top: 13px; z-index: 2; background: none; border: none; color: #999999; cursor: pointer; font-size: 13px; padding: 3px 5px; }
         .msf-clear:hover { color: #4200A8; }
         .msf-panel {
-            position: absolute; top: 47px; left: 0; right: 0; z-index: 100; background: white;
+            position: relative; top: -1px; left: 0; right: 0; z-index: 10; background: white;
             border: 1px solid #4200A8; border-top: none; border-radius: 0 0 10px 10px;
-            box-shadow: 0 14px 28px rgba(0,0,0,0.20); padding: 10px 12px 12px;
+            box-shadow: 0 6px 12px rgba(0,0,0,0.10); padding: 10px 12px 12px; margin-bottom: 8px;
         }
         .msf-search { width: 100%; padding: 8px 10px; margin-bottom: 8px; border: 1px solid #DDDDDD; border-radius: 6px; font-size: 14px; font-family: Arial, sans-serif; }
         .msf-actions { display: flex; gap: 18px; margin: 0 4px 4px; }
@@ -483,7 +524,7 @@ app.index_string = """
                 var btn = document.getElementById('msf-outside-trigger');
                 if (btn) { btn.click(); }
             }
-            if (e.target.id === 'modal-overlay') {
+            if (e.target && e.target.id === 'modal-overlay') {
                 var closeBtn = document.getElementById('close-modal-btn');
                 if (closeBtn) { closeBtn.click(); }
             }
@@ -497,6 +538,7 @@ dashboard_layout = html.Div(
     style={"backgroundColor": "#4200A8", "minHeight": "100vh", "fontFamily": "Arial, sans-serif", "margin": "0", "paddingBottom": "70px"},
     children=[
         dcc.Store(id="current-business-idx", storage_type="memory"),
+        dcc.Store(id="history-stack", data=[]),
         dcc.Store(id="fav-update-trigger", data=0),
         dcc.Store(id="comment-update-trigger", data=0),
         dcc.Store(id="edit-mode-store", data=False),
@@ -537,26 +579,28 @@ dashboard_layout = html.Div(
                 html.Div(
                     style={"backgroundColor": "white", "borderRadius": "20px", "padding": "28px", "boxShadow": "0 12px 30px rgba(0,0,0,0.20)", "marginBottom": "30px"},
                     children=[
-                        html.Label("🔍 Search businesses", style={"fontWeight": "bold", "color": "#2E1654"}),
-                        dcc.Input(
-                            id="search-input", type="text", placeholder="Search by business name...", debounce=True,
-                            style={"width": "100%", "padding": "14px", "marginTop": "8px", "marginBottom": "20px", "borderRadius": "10px", "border": "1px solid #CCCCCC", "fontSize": "16px", "height": "48px"},
-                        ),
+                        # Filters placed ABOVE search bar
                         html.Div(
-                            style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit, minmax(190px, 1fr))", "gap": "16px"},
+                            style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit, minmax(190px, 1fr))", "gap": "16px", "marginBottom": "20px"},
                             children=[
                                 multi_filter("industry", "🏭 Industry", options=INDUSTRY_OPTIONS),
                                 html.Div(id="category-filter-wrapper", style={"display": "none"}, children=[multi_filter("category", "📂 Category", options=CATEGORY_OPTIONS)]),
-                                multi_filter("suburb", "📍 Suburb", options=SUBURB_OPTIONS),
-                                multi_filter("accessibility", "⚙️ Advanced Options", options=ADVANCED_OPTIONS),
+                                multi_filter("council_area", "🏛️ Council Area", options=COUNCIL_OPTIONS),
+                                html.Div(id="suburb-filter-wrapper", style={"display": "none"}, children=[multi_filter("suburb", "📍 Suburb", options=SUBURB_OPTIONS)]),
                                 multi_filter("review_count", "💬 Review count", options=REVIEW_COUNT_OPTIONS),
+                                multi_filter("accessibility", "⚙️ Advanced Options", options=ADVANCED_OPTIONS),
                                 favourites_toggle(),
                             ],
+                        ),
+                        
+                        html.Label("🔍 Search businesses", style={"fontWeight": "bold", "color": "#2E1654"}),
+                        dcc.Input(
+                            id="search-input", type="text", placeholder="Search by business name...", debounce=True,
+                            style={"width": "100%", "padding": "14px", "marginTop": "8px", "borderRadius": "10px", "border": "1px solid #CCCCCC", "fontSize": "16px", "height": "48px"},
                         ),
                     ],
                 ),
 
-                # ── Results Table (Server-Side Pagination Configured) ───────
                 html.Div(
                     style={"backgroundColor": "white", "borderRadius": "20px", "padding": "28px", "boxShadow": "0 12px 30px rgba(0,0,0,0.20)"},
                     children=[
@@ -571,7 +615,6 @@ dashboard_layout = html.Div(
                                 for col in TABLE_COLS
                             ] + [{"name": "_row_idx", "id": "_row_idx", "editable": False}],
                             
-                            # Server-side operations
                             page_current=0,
                             page_size=10,
                             page_action="custom",
@@ -603,8 +646,10 @@ dashboard_layout = html.Div(
                 html.Div(
                     className="modal-card",
                     children=[
-                        html.Div(style={"padding": "16px 20px 0 0", "textAlign": "right", "flexShrink": "0", "background": "white", "borderRadius": "20px 20px 0 0"},
-                            children=[html.Button("✕", id="close-modal-btn", n_clicks=0, style={"background": "none", "border": "none", "fontSize": "20px", "cursor": "pointer", "color": "#666"})]
+                        html.Div(style={"padding": "16px 20px 0 20px", "display": "flex", "justifyContent": "flex-end", "alignItems": "center", "flexShrink": "0", "background": "white", "borderRadius": "20px 20px 0 0"},
+                            children=[
+                                html.Button("✕", id="close-modal-btn", n_clicks=0, style={"background": "none", "border": "none", "fontSize": "20px", "cursor": "pointer", "color": "#666"})
+                            ]
                         ),
                         html.Div(id="modal-content", style={"padding": "0 28px 28px 28px", "overflowY": "auto", "flex": "1 1 auto"}),
                     ],
@@ -683,6 +728,16 @@ def authenticate_user(n_clicks, logout_clicks, password):
 )
 def toggle_category_wrapper(industry):
     if industry:
+        return {"display": "block"}
+    return {"display": "none"}
+
+
+@app.callback(
+    Output("suburb-filter-wrapper", "style"),
+    Input({"type": "msf-checklist", "index": "council_area"}, "value"),
+)
+def toggle_suburb_wrapper(council_area):
+    if council_area:
         return {"display": "block"}
     return {"display": "none"}
 
@@ -801,6 +856,7 @@ def toggle_favourites_filter(_n_clicks, current):
     Output("result-count", "children"),
     Output({"type": "msf-store", "index": "industry"}, "data"),
     Output({"type": "msf-store", "index": "category"}, "data"),
+    Output({"type": "msf-store", "index": "council_area"}, "data"),
     Output({"type": "msf-store", "index": "suburb"}, "data"),
     Output({"type": "msf-store", "index": "accessibility"}, "data"),
     Output({"type": "msf-store", "index": "review_count"}, "data"),
@@ -810,6 +866,7 @@ def toggle_favourites_filter(_n_clicks, current):
     Input("search-input", "value"),
     Input({"type": "msf-checklist", "index": "industry"}, "value"),
     Input({"type": "msf-checklist", "index": "category"}, "value"),
+    Input({"type": "msf-checklist", "index": "council_area"}, "value"),
     Input({"type": "msf-checklist", "index": "suburb"}, "value"),
     Input({"type": "msf-checklist", "index": "accessibility"}, "value"),
     Input({"type": "msf-checklist", "index": "review_count"}, "value"),
@@ -819,7 +876,7 @@ def toggle_favourites_filter(_n_clicks, current):
     Input("auth-session", "data"),
     Input("edit-save-trigger", "data"),
 )
-def update_table_server_side(page_current, page_size, sort_by, search, industry, category, suburb, accessibility, review_count, _clear_clicks, fav_only, _trig, _auth, _edit):
+def update_table_server_side(page_current, page_size, sort_by, search, industry, category, council_area, suburb, accessibility, review_count, _clear_clicks, fav_only, _trig, _auth, _edit):
     trig = ctx.triggered_id
     if isinstance(trig, dict) and trig.get("type") == "msf-clear":
         cleared_index = trig["index"]
@@ -827,6 +884,8 @@ def update_table_server_side(page_current, page_size, sort_by, search, industry,
             industry = []
         elif cleared_index == "category":
             category = []
+        elif cleared_index == "council_area":
+            council_area = []
         elif cleared_index == "suburb":
             suburb = []
         elif cleared_index == "accessibility":
@@ -836,17 +895,22 @@ def update_table_server_side(page_current, page_size, sort_by, search, industry,
 
     if not industry:
         category = []
+    if not council_area:
+        suburb = []
 
     masks = get_filter_masks(
         businesses, search=search, industry=industry, category=category,
-        suburb=suburb, accessibility=accessibility, review_count=review_count,
-        favourites_only=fav_only
+        council_area=council_area, suburb=suburb, accessibility=accessibility,
+        review_count=review_count, favourites_only=fav_only
     )
 
-    combined_all = masks["search"] & masks["industry"] & masks["category"] & masks["suburb"] & masks["accessibility"] & masks["review_count"] & masks["favourites"]
+    combined_all = (
+        masks["search"] & masks["industry"] & masks["category"] & 
+        masks["council_area"] & masks["suburb"] & masks["accessibility"] & 
+        masks["review_count"] & masks["favourites"]
+    )
     filtered = businesses[combined_all]
 
-    # Handle Server-Side Sorting
     if sort_by and len(sort_by) > 0:
         col = sort_by[0]["column_id"]
         ascending = sort_by[0]["direction"] == "asc"
@@ -858,16 +922,16 @@ def update_table_server_side(page_current, page_size, sort_by, search, industry,
     total_rows = len(filtered)
     page_count = max(1, (total_rows + page_size - 1) // page_size)
     
-    # Slice ONLY current page (10 rows)
     start_idx = page_current * page_size
     end_idx = start_idx + page_size
     page_slice = filtered.iloc[start_idx:end_idx]
 
-    ind_mask = masks["search"] & masks["category"] & masks["suburb"] & masks["accessibility"] & masks["review_count"] & masks["favourites"]
-    cat_mask = masks["search"] & masks["industry"] & masks["suburb"] & masks["accessibility"] & masks["review_count"] & masks["favourites"]
-    sub_mask = masks["search"] & masks["industry"] & masks["category"] & masks["accessibility"] & masks["review_count"] & masks["favourites"]
-    acc_mask = masks["search"] & masks["industry"] & masks["category"] & masks["suburb"] & masks["review_count"] & masks["favourites"]
-    rev_mask = masks["search"] & masks["industry"] & masks["category"] & masks["suburb"] & masks["accessibility"] & masks["favourites"]
+    ind_mask = masks["search"] & masks["category"] & masks["council_area"] & masks["suburb"] & masks["accessibility"] & masks["review_count"] & masks["favourites"]
+    cat_mask = masks["search"] & masks["industry"] & masks["council_area"] & masks["suburb"] & masks["accessibility"] & masks["review_count"] & masks["favourites"]
+    cncl_mask = masks["search"] & masks["industry"] & masks["category"] & masks["suburb"] & masks["accessibility"] & masks["review_count"] & masks["favourites"]
+    sub_mask = masks["search"] & masks["industry"] & masks["category"] & masks["council_area"] & masks["accessibility"] & masks["review_count"] & masks["favourites"]
+    acc_mask = masks["search"] & masks["industry"] & masks["category"] & masks["council_area"] & masks["suburb"] & masks["review_count"] & masks["favourites"]
+    rev_mask = masks["search"] & masks["industry"] & masks["category"] & masks["council_area"] & masks["suburb"] & masks["accessibility"] & masks["favourites"]
 
     display_data = page_slice[TABLE_COLS].copy()
     display_data["_row_idx"] = page_slice.index
@@ -886,6 +950,7 @@ def update_table_server_side(page_current, page_size, sort_by, search, industry,
         f"{total_rows} businesses found",
         make_options(businesses.loc[ind_mask, "Industry"].unique()),
         make_options(businesses.loc[cat_mask, "Category"].unique()),
+        make_options(businesses.loc[cncl_mask, "Council Area"].unique()),
         make_options(businesses.loc[sub_mask, "Suburb"].unique()),
         compute_accessibility_options(businesses[acc_mask]),
         compute_review_count_options(businesses[rev_mask]),
@@ -909,17 +974,23 @@ def _detail_field(label, value, is_link=False, icon="", link_text="Open link →
     ], style={"marginBottom": "10px"})
 
 
-def _category_card(title, icon, fields):
+def _category_card(title, icon, fields, header_right=None):
     return html.Div(
         style={"background": "#F8F5FF", "borderRadius": "12px", "padding": "16px", "marginBottom": "16px"},
         children=[
-            html.H4(f"{icon} {title}", style={"color": "#2E1654", "marginTop": "0", "marginBottom": "12px", "fontSize": "16px"}),
+            html.Div(
+                style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "marginBottom": "12px"},
+                children=[
+                    html.H4(f"{icon} {title}", style={"color": "#2E1654", "margin": "0", "fontSize": "16px"}),
+                    header_right if header_right else html.Div(),
+                ]
+            ),
             html.Div(fields),
         ],
     )
 
 
-def _build_modal_content(row_idx, row, edit_mode=False):
+def _build_modal_content(row_idx, row, edit_mode=False, show_back=False):
     business_name = row.get("Business Name", "")
     is_fav = bool(row.get("_is_fav", False))
     comments_dict = load_comments()
@@ -988,6 +1059,7 @@ def _build_modal_content(row_idx, row, edit_mode=False):
         specs_fields = [
             _detail_field("Category", row.get("Category"), icon="📂"),
             _detail_field("Industry", row.get("Industry"), icon="🏭"),
+            _detail_field("Council Area", row.get("Council Area"), icon="🏛️"),
         ]
     
     for day in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]:
@@ -1000,39 +1072,65 @@ def _build_modal_content(row_idx, row, edit_mode=False):
         _detail_field("Rating", ts_display, icon="⭐"),
     ])
 
-    # ── Pop-Up Additional Information Logic ─────────────────────────────────
     additional_info_fields = []
-
-    # 1. Individual Wheelchair Options
     for feature in WHEELCHAIR_COLS:
         val = parse_bool(row.get(feature))
         if val is not None:
             additional_info_fields.append(_detail_field(feature, "Yes" if val else "No", icon="♿"))
 
-    # 2. Assistive Hearing Loop
     ahl_val = parse_bool(row.get("Assistive Hearing Loop"))
     if ahl_val is not None:
         additional_info_fields.append(_detail_field("Assistive Hearing Loop", "Yes" if ahl_val else "No", icon="🦻"))
 
-    # 3. LGBTQ+ Friendly (Likely)
     lgbt_val = parse_bool(row.get("LGBTQ+ Friendly (Likely)"))
     if lgbt_val is not None:
         additional_info_fields.append(_detail_field("LGBTQ+ Friendly (Likely)", "Yes" if lgbt_val else "No", icon="🌈"))
 
-    # 4. Sensory Sensitivity (Loud)
     loud_val = parse_bool(row.get("Sensory Sensitivity (Loud)"))
     if loud_val is not None:
         additional_info_fields.append(_detail_field("Sensory Sensitivity (Loud)", "Yes" if loud_val else "No", icon="🔊"))
 
-    # 5. Sensory Sensitivity (Quiet)
     quiet_val = parse_bool(row.get("Sensory Sensitivity (Quiet)"))
     if quiet_val is not None:
         additional_info_fields.append(_detail_field("Sensory Sensitivity (Quiet)", "Yes" if quiet_val else "No", icon="🤫"))
 
-    # 6. Family-Friendly
     ff_val = parse_bool(row.get("Family-Friendly"))
     if ff_val is not None:
         additional_info_fields.append(_detail_field("Family-Friendly", "Yes" if ff_val else "No", icon="👨‍👩‍👧‍👦"))
+
+    # ── Similar Businesses Cards (Top 3) ──────────────────────────────────────
+    top_similar = get_top_similar(row_idx, top_n=3)
+    similar_cards = []
+    for s_idx, _ in top_similar:
+        s_row = businesses.loc[s_idx]
+        similar_cards.append(
+            html.Div(
+                style={
+                    "display": "flex", "justifyContent": "space-between", "alignItems": "center",
+                    "background": "white", "padding": "12px 14px", "borderRadius": "10px",
+                    "marginBottom": "8px", "border": "1px solid #E5DDF5"
+                },
+                children=[
+                    html.Div([
+                        html.Strong(s_row["Business Name"], style={"color": "#2E1654", "fontSize": "15px"}),
+                        html.Div(
+                            f"📍 {s_row['Suburb']}  •  🏭 {s_row['Industry']}  •  📂 {s_row['Category']}",
+                            style={"color": "#666", "fontSize": "13px", "marginTop": "4px"}
+                        )
+                    ]),
+                    html.Button(
+                        "👁️ View",
+                        id={"type": "open-similar-btn", "index": int(s_idx)},
+                        n_clicks=0,
+                        style={
+                            "background": "#66F2E3", "color": "#2E1654", "border": "none",
+                            "padding": "6px 12px", "borderRadius": "16px", "fontWeight": "bold",
+                            "cursor": "pointer", "fontSize": "13px"
+                        }
+                    )
+                ]
+            )
+        )
 
     if edit_mode:
         action_buttons = html.Div(
@@ -1050,6 +1148,15 @@ def _build_modal_content(row_idx, row, edit_mode=False):
             ]
         )
 
+    back_button_el = html.Button(
+        "⬅️ Back", id="back-modal-btn", n_clicks=0,
+        style={
+            "background": "#F8F5FF", "border": "1px solid #4200A8", "color": "#4200A8",
+            "borderRadius": "12px", "padding": "6px 14px", "cursor": "pointer",
+            "fontWeight": "bold", "fontSize": "14px", "display": "inline-block" if show_back else "none"
+        }
+    )
+
     return html.Div([
         html.Div([
             html.H2(business_name, style={"color": "#2E1654", "margin": "0", "fontSize": "32px", "display": "inline"}),
@@ -1064,6 +1171,7 @@ def _build_modal_content(row_idx, row, edit_mode=False):
         _category_card("Business Contact", "📇", contact_fields),
         _category_card("Business Specs", "📋", specs_fields),
         _category_card("Additional Information", "🤝", additional_info_fields if additional_info_fields else [html.Div("—")]),
+        _category_card("Similar Businesses", "🎯", similar_cards, header_right=back_button_el),
 
         html.Hr(style={"border": "none", "borderTop": "1px solid #EEEEEE", "margin": "20px 0"}),
         html.H4("💬 Comments", style={"color": "#2E1654", "marginBottom": "12px"}),
@@ -1081,35 +1189,59 @@ def _build_modal_content(row_idx, row, edit_mode=False):
     Output("modal-overlay", "style"),
     Output("modal-content", "children"),
     Output("current-business-idx", "data"),
+    Output("history-stack", "data"),
     Output("business-table", "active_cell"),
     Input("business-table", "active_cell"),
     Input("fav-update-trigger", "data"),
     Input("comment-update-trigger", "data"),
     Input("close-modal-btn", "n_clicks"),
+    Input("back-modal-btn", "n_clicks", allow_optional=True),
     Input("edit-mode-store", "data"),
     Input("edit-save-trigger", "data"),
+    Input({"type": "open-similar-btn", "index": ALL}, "n_clicks"),
     State("current-business-idx", "data"),
+    State("history-stack", "data"),
     prevent_initial_call=True,
 )
-def update_modal(active_cell, _fav, _com, close_clicks, edit_mode, _edit_save, current_idx):
+def update_modal(active_cell, _fav, _com, close_clicks, back_clicks, edit_mode, _edit_save, similar_clicks_list, current_idx, history_stack):
     triggered = ctx.triggered_id
+    history_stack = history_stack or []
 
     if triggered == "close-modal-btn" and close_clicks:
-        return {"display": "none"}, html.Div(), None, None
+        return {"display": "none"}, html.Div(), None, [], None
+
+    # Handle Back Button Navigation
+    if triggered == "back-modal-btn" and back_clicks:
+        if not history_stack:
+            raise PreventUpdate
+        prev_idx = history_stack.pop()
+        row = businesses.loc[prev_idx].to_dict()
+        detail = _build_modal_content(prev_idx, row, edit_mode=False, show_back=len(history_stack) > 0)
+        return {"display": "flex"}, detail, prev_idx, history_stack, no_update
+
+    # Handle clicking a "Similar Business" button inside the modal card
+    if isinstance(triggered, dict) and triggered.get("type") == "open-similar-btn":
+        target_idx = triggered["index"]
+        if target_idx in businesses.index:
+            if current_idx is not None:
+                history_stack.append(current_idx)
+            row = businesses.loc[target_idx].to_dict()
+            detail = _build_modal_content(target_idx, row, edit_mode=False, show_back=True)
+            return {"display": "flex"}, detail, target_idx, history_stack, no_update
 
     if triggered in ("fav-update-trigger", "comment-update-trigger", "edit-save-trigger"):
         if current_idx is None or current_idx not in businesses.index:
             raise PreventUpdate
         row = businesses.loc[current_idx].to_dict()
-        detail = _build_modal_content(current_idx, row, edit_mode=False if triggered in ("fav-update-trigger", "edit-save-trigger") else edit_mode)
-        return {"display": "flex"}, detail, current_idx, no_update
+        detail = _build_modal_content(current_idx, row, edit_mode=False if triggered in ("fav-update-trigger", "edit-save-trigger") else edit_mode, show_back=len(history_stack) > 0)
+        return {"display": "flex"}, detail, current_idx, history_stack, no_update
 
     if triggered == "edit-mode-store":
         if current_idx is None or current_idx not in businesses.index:
             raise PreventUpdate
         row = businesses.loc[current_idx].to_dict()
-        detail = _build_modal_content(current_idx, row, edit_mode=edit_mode)
-        return {"display": "flex"}, detail, current_idx, no_update
+        detail = _build_modal_content(current_idx, row, edit_mode=edit_mode, show_back=len(history_stack) > 0)
+        return {"display": "flex"}, detail, current_idx, history_stack, no_update
 
     if not active_cell:
         raise PreventUpdate
@@ -1119,8 +1251,8 @@ def update_modal(active_cell, _fav, _com, close_clicks, edit_mode, _edit_save, c
         raise PreventUpdate
 
     row = businesses.loc[orig_idx].to_dict()
-    detail = _build_modal_content(orig_idx, row, edit_mode=False)
-    return {"display": "flex"}, detail, orig_idx, no_update
+    detail = _build_modal_content(orig_idx, row, edit_mode=False, show_back=False)
+    return {"display": "flex"}, detail, orig_idx, [], no_update
 
 
 @app.callback(
@@ -1153,13 +1285,11 @@ def save_business_details(save_clicks, industry_val, category_val, phone_val, em
     if not save_clicks or current_idx is None or current_idx not in businesses.index:
         raise PreventUpdate
 
-    # In-memory instant updates
     businesses.loc[current_idx, "Industry"] = str(industry_val or "").strip()
     businesses.loc[current_idx, "Category"] = str(category_val or "").strip()
     businesses.loc[current_idx, "Phone"] = str(phone_val or "").strip()
     businesses.loc[current_idx, "Email"] = str(email_val or "").strip()
 
-    # Async background disk write
     threading.Thread(target=_async_save_csv, args=(businesses.copy(),), daemon=True).start()
 
     return datetime.now().isoformat(), False
