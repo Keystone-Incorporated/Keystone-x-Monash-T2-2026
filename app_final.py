@@ -106,23 +106,45 @@ def remove_favourite(business_name):
             {"business_name": business_name}
         )
 
-@lru_cache(maxsize=1)
-def load_comments():
-    if COMMENTS_FILE.exists():
-        try:
-            with open(COMMENTS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+# @lru_cache(maxsize=1)
+def get_comments(business_name):
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT id, comment_text, created_at
+                FROM public.comments
+                WHERE business_name = :business_name
+                ORDER BY created_at ASC
+            """),
+            {"business_name": business_name}
+        ).mappings().all()
 
-def _async_save_comments(comments):
-    with open(COMMENTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(comments, f, indent=2, ensure_ascii=False)
+    return list(rows)
 
-def save_comments(comments):
-    threading.Thread(target=_async_save_comments, args=(comments,), daemon=True).start()
-    load_comments.cache_clear()
+
+def add_comment(business_name, comment_text):
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO public.comments (business_name, comment_text)
+                VALUES (:business_name, :comment_text)
+            """),
+            {
+                "business_name": business_name,
+                "comment_text": comment_text
+            }
+        )
+
+
+def delete_comment(comment_id):
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                DELETE FROM public.comments
+                WHERE id = :comment_id
+            """),
+            {"comment_id": int(comment_id)}
+        )
 
 def _async_save_csv(df_copy):
     with _CSV_LOCK:
@@ -1020,20 +1042,57 @@ def _category_card(title, icon, fields, header_right=None):
 def _build_modal_content(row_idx, row, edit_mode=False, show_back=False):
     business_name = row.get("Business Name", "")
     is_fav = bool(row.get("_is_fav", False))
-    comments_dict = load_comments()
-    comments = comments_dict.get(business_name, [])
+    comments = get_comments(business_name)
 
     if comments:
         comments_children = []
-        for i, c in enumerate(comments):
+        for c in comments:
             comments_children.append(
                 html.Div([
                     html.Div([
-                        html.Small(datetime.fromisoformat(c["time"]).strftime("%d %b %Y %H:%M"), style={"color": "#888", "fontSize": "12px"}),
-                        html.Button("🗑️", id={"type": "delete-comment-btn", "index": i}, n_clicks=0, title="Delete comment", style={"background": "none", "border": "none", "cursor": "pointer", "fontSize": "16px", "padding": "0 4px"}),
-                    ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center"}),
-                    html.P(c["text"], style={"marginTop": "4px", "color": "#333", "whiteSpace": "pre-wrap"})
-                ], style={"background": "#F8F5FF", "padding": "12px", "borderRadius": "8px", "marginBottom": "8px"})
+                        html.Small(
+                            c["created_at"].strftime("%d %b %Y %H:%M"),
+                            style={
+                                "color": "#888",
+                                "fontSize": "12px"
+                            }
+                        ),
+                        html.Button(
+                            "🗑️",
+                            id={
+                                "type": "delete-comment-btn",
+                                "index": int(c["id"])
+                            },
+                            n_clicks=0,
+                            title="Delete comment",
+                            style={
+                                "background": "none",
+                                "border": "none",
+                                "cursor": "pointer",
+                                "fontSize": "16px",
+                                "padding": "0 4px"
+                            }
+                        ),
+                    ], style={
+                        "display": "flex",
+                        "justifyContent": "space-between",
+                        "alignItems": "center"
+                    }),
+
+                    html.P(
+                        c["comment_text"],
+                        style={
+                            "marginTop": "4px",
+                            "color": "#333",
+                            "whiteSpace": "pre-wrap"
+                        }
+                    )
+                ], style={
+                    "background": "#F8F5FF",
+                    "padding": "12px",
+                    "borderRadius": "8px",
+                    "marginBottom": "8px"
+                })
             )
     else:
         comments_children = html.P("💬 No comments yet. Be the first to add one!", style={"color": "#888", "fontStyle": "italic"})
@@ -1362,41 +1421,44 @@ def toggle_favourite(n_clicks, current_idx):
     State("comment-input", "value"),
     prevent_initial_call=True,
 )
-def manage_comments(add_clicks, delete_clicks_list, current_idx, text):
-    if current_idx is None or current_idx not in businesses.index:
+def manage_comments(
+    add_clicks,
+    delete_clicks_list,
+    current_idx,
+    text
+):
+    if (
+        current_idx is None
+        or current_idx not in businesses.index
+    ):
         raise PreventUpdate
 
-    business_name = businesses.loc[current_idx, "Business Name"]
+    business_name = str(
+        businesses.loc[current_idx, "Business Name"]
+    )
+
     triggered_id = ctx.triggered_id
 
     if triggered_id == "add-comment-btn":
         if not add_clicks or not text or not text.strip():
             raise PreventUpdate
 
-        comments_dict = load_comments()
-        if business_name not in comments_dict:
-            comments_dict[business_name] = []
+        add_comment(
+            business_name,
+            text.strip()
+        )
 
-        comments_dict[business_name].append({
-            "time": datetime.now().isoformat(),
-            "text": text.strip(),
-        })
-        save_comments(comments_dict)
         return add_clicks, ""
 
-    elif isinstance(triggered_id, dict) and triggered_id.get("type") == "delete-comment-btn":
-        comment_idx = triggered_id["index"]
-        comments_dict = load_comments()
-        if business_name not in comments_dict:
-            raise PreventUpdate
+    elif (
+        isinstance(triggered_id, dict)
+        and triggered_id.get("type") == "delete-comment-btn"
+    ):
+        comment_id = triggered_id["index"]
 
-        comments = comments_dict[business_name]
-        if 0 <= comment_idx < len(comments):
-            comments.pop(comment_idx)
-            if not comments:
-                del comments_dict[business_name]
-            save_comments(comments_dict)
-            return datetime.now().timestamp(), text
+        delete_comment(comment_id)
+
+        return datetime.now().timestamp(), text
 
     raise PreventUpdate
 
