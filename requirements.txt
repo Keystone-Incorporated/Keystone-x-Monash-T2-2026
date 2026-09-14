@@ -5,3 +5,5 @@ gunicorn
 SQLAlchemy
 psycopg2-binary
 scikit-learn
+SQLAlchemy
+psycopg2-binary

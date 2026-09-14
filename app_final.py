@@ -10,6 +10,7 @@ import pandas as pd
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import MinMaxScaler
+from sqlalchemy import create_engine, text
 
 from dash import Dash, Input, Output, State, dash_table, dcc, html, ctx, ALL, MATCH
 from dash.exceptions import PreventUpdate
@@ -40,12 +41,23 @@ def load_local_env():
 load_local_env()
 ACCESS_PASSWORD = os.getenv("DASH_ACCESS_PASSWORD")
 SESSION_SECRET = os.getenv("DASH_SESSION_SECRET") or secrets.token_urlsafe(32)
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is not set. Add it to the local .env file."
+    )
 
 if not ACCESS_PASSWORD:
     raise RuntimeError(
         "DASH_ACCESS_PASSWORD is not set. Add it to the local .env file "
         "before starting the dashboard."
     )
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True
+)
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 DATA_FILE = Path(__file__).with_name("Merged_Business_Data.csv")
@@ -59,25 +71,40 @@ _CSV_LOCK = threading.Lock()
 
 def load_favourites():
     global _FAV_SET
-    if FAVOURITES_FILE.exists():
-        try:
-            with open(FAVOURITES_FILE, "r", encoding="utf-8") as f:
-                _FAV_SET = set(json.load(f))
-                return _FAV_SET
-        except Exception:
-            _FAV_SET = set()
-            return _FAV_SET
-    _FAV_SET = set()
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT business_name
+                FROM public.favourites
+            """)
+        ).fetchall()
+
+    _FAV_SET = {row[0] for row in rows}
     return _FAV_SET
 
-def _async_save_favourites(favs_list):
-    with open(FAVOURITES_FILE, "w", encoding="utf-8") as f:
-        json.dump(favs_list, f, indent=2)
 
-def save_favourites(favs):
-    global _FAV_SET
-    _FAV_SET = set(favs)
-    threading.Thread(target=_async_save_favourites, args=(sorted(list(_FAV_SET)),), daemon=True).start()
+def add_favourite(business_name):
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO public.favourites (business_name)
+                VALUES (:business_name)
+                ON CONFLICT (business_name) DO NOTHING
+            """),
+            {"business_name": business_name}
+        )
+
+
+def remove_favourite(business_name):
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                DELETE FROM public.favourites
+                WHERE business_name = :business_name
+            """),
+            {"business_name": business_name}
+        )
 
 @lru_cache(maxsize=1)
 def load_comments():
@@ -1305,17 +1332,24 @@ def toggle_favourite(n_clicks, current_idx):
     if not n_clicks or current_idx is None or current_idx not in businesses.index:
         raise PreventUpdate
 
-    fav_set = _FAV_SET
-    current_state = businesses.loc[current_idx, "_is_fav"]
+    business_name = str(
+        businesses.loc[current_idx, "Business Name"]
+    )
+
+    current_state = bool(
+        businesses.loc[current_idx, "_is_fav"]
+    )
+
     new_state = not current_state
     businesses.loc[current_idx, "_is_fav"] = new_state
 
     if new_state:
-        fav_set.add(current_idx)
+        _FAV_SET.add(business_name)
+        add_favourite(business_name)
     else:
-        fav_set.discard(current_idx)
-        
-    save_favourites(fav_set)
+        _FAV_SET.discard(business_name)
+        remove_favourite(business_name)
+
     return n_clicks
 
 
