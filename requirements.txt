@@ -5,4 +5,4 @@ gunicorn
 SQLAlchemy
 psycopg2-binary
 scikit-learn
-plotly
+plotly==5.24.1
