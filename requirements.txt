@@ -5,3 +5,4 @@ gunicorn
 SQLAlchemy
 psycopg2-binary
 scikit-learn
+plotly
