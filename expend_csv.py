@@ -2,7 +2,7 @@ import pandas as pd
 
 df = pd.read_csv("Merged_Business_Data.csv", encoding="utf-8-sig")
 
-target_n = 10000
+target_n = 20000
 
 df_nk = df.sample(
     n=target_n,
