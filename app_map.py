@@ -262,18 +262,20 @@ def compute_similarity_matrix(df):
     # Combined matrix with requested 30/30/30/10 weights
     return (0.30 * ind_sim) + (0.30 * cat_sim) + (0.30 * geo_sim) + (0.10 * rev_sim)
 
-SIMILARITY_MATRIX = compute_similarity_matrix(businesses)
+# Disabled for Render capacity testing
+# SIMILARITY_MATRIX = compute_similarity_matrix(businesses)
 
 def get_top_similar(row_idx, top_n=3):
-    scores = list(enumerate(SIMILARITY_MATRIX[row_idx]))
-    scores = sorted(scores, key=lambda x: x[1], reverse=True)
-    top_items = []
-    for idx, score in scores:
-        if idx != row_idx:
-            top_items.append((idx, score))
-        if len(top_items) == top_n:
-            break
-    return top_items
+    return []
+    # scores = list(enumerate(SIMILARITY_MATRIX[row_idx]))
+    # scores = sorted(scores, key=lambda x: x[1], reverse=True)
+    # top_items = []
+    # for idx, score in scores:
+    #     if idx != row_idx:
+    #         top_items.append((idx, score))
+    #     if len(top_items) == top_n:
+    #         break
+    # return top_items
 
 # ── Filter Options Configuration ─────────────────────────────────────────────
 def make_options(values):
