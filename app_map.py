@@ -877,39 +877,63 @@ def msf_render_panel(active, toggle_id):
 
 
 @app.callback(
-    Output({"type": "msf-checklist", "index": MATCH}, "options"),
     Output({"type": "msf-checklist", "index": MATCH}, "value"),
-    Input({"type": "msf-store", "index": MATCH}, "data"),
-    Input({"type": "msf-search", "index": MATCH}, "value"),
     Input({"type": "msf-all", "index": MATCH}, "n_clicks"),
     Input({"type": "msf-none", "index": MATCH}, "n_clicks"),
     Input({"type": "msf-clear", "index": MATCH}, "n_clicks"),
+    State({"type": "msf-store", "index": MATCH}, "data"),
+    State({"type": "msf-search", "index": MATCH}, "value"),
     State({"type": "msf-checklist", "index": MATCH}, "value"),
+    prevent_initial_call=True,
 )
-def msf_sync(all_options, search, _all_clicks, _none_clicks, _clear_clicks, current):
+def msf_value_actions(_all_clicks, _none_clicks, _clear_clicks, all_options, search, current):
+    # This callback ONLY writes "value", and only in response to the user
+    # directly clicking Select All / Deselect All / Clear on THIS filter.
+    # It reads the store as State (a snapshot), never as Input, so it never
+    # reacts to update_table_server_side's own output. That matters because
+    # update_table_server_side reads checklist "value" as an Input: if this
+    # callback also reacted to "msf-store" data (an Input), we'd have a real
+    # cycle (value -> update_table_server_side -> store -> this callback ->
+    # value again). Dash's loop protection for pattern-matching (MATCH)
+    # callbacks tracks "already fired this update" per callback definition,
+    # not per matched instance — so once that cycle fired for ANY one filter,
+    # Dash would silently block it from firing again for every OTHER filter
+    # in the same update, leaving their option lists stale until the user
+    # interacted with them directly. Keeping this callback input-free of the
+    # store avoids that entirely.
     all_options = all_options or []
     current = current or []
 
     query = (search or "").strip().lower()
-    visible = [o for o in all_options if not query or query in str(o["label"]).lower()]
-    visible_values = {o["value"] for o in visible}
+    visible_values = {o["value"] for o in all_options if not query or query in str(o["label"]).lower()}
 
-    trig = ctx.triggered_id
-    trig_type = trig.get("type") if isinstance(trig, dict) else trig
+    trig_type = ctx.triggered_id.get("type") if isinstance(ctx.triggered_id, dict) else ctx.triggered_id
 
     if trig_type == "msf-all":
-        value = sorted(set(current) | visible_values)
-    elif trig_type == "msf-none":
-        value = [v for v in current if v not in visible_values]
-    elif trig_type == "msf-clear":
-        value = []
-    elif trig_type == "msf-store":
-        valid = {o["value"] for o in all_options}
-        value = [v for v in current if v in valid]
-    else:
-        value = current
+        return sorted(set(current) | visible_values)
+    if trig_type == "msf-none":
+        return [v for v in current if v not in visible_values]
+    if trig_type == "msf-clear":
+        return []
+    raise PreventUpdate
 
-    return visible, value
+
+@app.callback(
+    Output({"type": "msf-checklist", "index": MATCH}, "options"),
+    Input({"type": "msf-store", "index": MATCH}, "data"),
+    Input({"type": "msf-search", "index": MATCH}, "value"),
+)
+def msf_options_from_store(all_options, search):
+    # This callback ONLY writes "options", never "value", so it can react
+    # freely to the store (which is refreshed by update_table_server_side
+    # every time any OTHER filter changes) without closing the value/store
+    # loop described above. A previously-checked value that's no longer in
+    # "options" simply won't render as checked; it doesn't get silently
+    # dropped from "value", so it comes back automatically if the other
+    # filters are relaxed again.
+    all_options = all_options or []
+    query = (search or "").strip().lower()
+    return [o for o in all_options if not query or query in str(o["label"]).lower()]
 
 
 @app.callback(
@@ -968,29 +992,18 @@ def toggle_favourites_filter(_n_clicks, current):
     Input({"type": "msf-checklist", "index": "suburb"}, "value"),
     Input({"type": "msf-checklist", "index": "accessibility"}, "value"),
     Input({"type": "msf-checklist", "index": "review_count"}, "value"),
-    Input({"type": "msf-clear", "index": ALL}, "n_clicks"),
     Input("favourites-toggle-store", "data"),
     Input("fav-update-trigger", "data"),
     Input("auth-session", "data"),
     Input("edit-save-trigger", "data"),
 )
-def update_table_server_side(page_current, page_size, sort_by, search, industry, category, council_area, suburb, accessibility, review_count, _clear_clicks, fav_only, _trig, _auth, _edit):
-    trig = ctx.triggered_id
-    if isinstance(trig, dict) and trig.get("type") == "msf-clear":
-        cleared_index = trig["index"]
-        if cleared_index == "industry":
-            industry = []
-        elif cleared_index == "category":
-            category = []
-        elif cleared_index == "council_area":
-            council_area = []
-        elif cleared_index == "suburb":
-            suburb = []
-        elif cleared_index == "accessibility":
-            accessibility = []
-        elif cleared_index == "review_count":
-            review_count = []
-
+def update_table_server_side(page_current, page_size, sort_by, search, industry, category, council_area, suburb, accessibility, review_count, fav_only, _trig, _auth, _edit):
+    # Note: this callback intentionally does NOT listen to the msf-clear (✕)
+    # buttons directly. Those buttons only clear the checklist's own "value"
+    # (via msf_value_actions); this callback reacts to that value change
+    # instead. That keeps there being exactly one source of truth for each
+    # filter's current selection, so a filter that was just cleared can never
+    # be read here as still-selected.
     if not industry:
         category = []
     if not council_area:
@@ -1402,14 +1415,17 @@ def update_modal(active_cell, map_click, _fav, _com, close_clicks, back_clicks, 
             raise PreventUpdate
         row = businesses.loc[current_idx].to_dict()
         detail = _build_modal_content(current_idx, row, edit_mode=False if triggered in ("fav-update-trigger", "edit-save-trigger") else edit_mode, show_back=len(history_stack) > 0)
-        return {"display": "flex"}, detail, current_idx, history_stack, no_update, no_update
+        # Don't re-emit current_idx here: it hasn't changed, and writing it
+        # again would re-trigger the scroll-to-top clientside callback.
+        return {"display": "flex"}, detail, no_update, history_stack, no_update, no_update
 
     if triggered == "edit-mode-store":
         if current_idx is None or current_idx not in businesses.index:
             raise PreventUpdate
         row = businesses.loc[current_idx].to_dict()
         detail = _build_modal_content(current_idx, row, edit_mode=edit_mode, show_back=len(history_stack) > 0)
-        return {"display": "flex"}, detail, current_idx, history_stack, no_update, no_update
+        # Same here — entering/leaving edit mode shouldn't reset scroll position.
+        return {"display": "flex"}, detail, no_update, history_stack, no_update, no_update
 
     # Handle clicking a dot on the map
     if triggered == "business-map" and map_click:
