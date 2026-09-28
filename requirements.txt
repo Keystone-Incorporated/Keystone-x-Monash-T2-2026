@@ -4,4 +4,6 @@ openpyxl
 gunicorn
 SQLAlchemy
 psycopg2-binary
+numpy
+anthropic
 plotly==5.24.1
