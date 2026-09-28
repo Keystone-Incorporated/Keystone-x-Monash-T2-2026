@@ -4,5 +4,4 @@ openpyxl
 gunicorn
 SQLAlchemy
 psycopg2-binary
-scikit-learn
 plotly==5.24.1
