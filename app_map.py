@@ -9,8 +9,6 @@ from functools import lru_cache
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.preprocessing import MinMaxScaler
 
 from dash import Dash, Input, Output, State, dash_table, dcc, html, ctx, ALL, MATCH
 from dash.exceptions import PreventUpdate
@@ -177,103 +175,174 @@ for c in WHEELCHAIR_COLS + ["Assistive Hearing Loop", "Wheelchair Accessible (Li
     if c not in businesses.columns:
         businesses[c] = None
 
-def get_wheelchair_likely(row):
-    vals = [parse_bool(row[c]) for c in WHEELCHAIR_COLS]
-    if any(v is True for v in vals):
-        return True
-    if all(v is False for v in vals if v is not None) and any(v is False for v in vals):
-        return False
-    return None
+# ── One-time, vectorised boolean conversion ──────────────────────────────────
+# Every flag column the filters use becomes a pandas nullable "boolean" column
+# (True / False / <NA> = unknown), so filtering is a plain array lookup instead of
+# calling parse_bool on every row on every filter change. parse_bool (above) is still
+# used for single values in the business detail modal, and it handles <NA> correctly.
+#
+# If the database later stores these as real BOOLEAN columns, only this block
+# (normalise_flags) needs to change or be removed.
+_TRUE_STRINGS = {"true", "1", "yes"}
+_FALSE_STRINGS = {"false", "0", "no"}
 
-w_likely = businesses.apply(get_wheelchair_likely, axis=1)
-businesses["Wheelchair Accessible (Likely)"] = businesses["Wheelchair Accessible (Likely)"].apply(parse_bool).combine_first(w_likely)
 
-if "Quiet" in businesses.columns:
-    businesses["Sensory Sensitivity (Quiet)"] = businesses["Quiet"].apply(parse_bool)
+def _from_tf(is_true, is_false, index):
+    """Build a nullable boolean Series: True where is_true, False where is_false, else <NA>."""
+    arr = pd.array(np.where(is_true, True, False), dtype="boolean")
+    arr[~(is_true | is_false)] = pd.NA
+    return pd.Series(arr, index=index)
 
-loud_raw_cols = [c for c in ["Dancing", "Karaoke", "Live-Music", "Live-Performances", "Live Music", "Live Performances"] if c in businesses.columns]
-if loud_raw_cols:
-    def get_loud(row):
-        vals = [parse_bool(row[c]) for c in loud_raw_cols]
-        return True if any(v is True for v in vals) else None
-    businesses["Sensory Sensitivity (Loud)"] = businesses["Sensory Sensitivity (Loud)"].apply(parse_bool).combine_first(businesses.apply(get_loud, axis=1))
 
-ff_raw_cols = [c for c in ["Good For Kids", "Good For Kids Birthday", "Has Changing Table(S)", "Has Changing Table", 
-                          "Highchairs", "Kid-Friendly activities", "Kid's Menu", "Kids Menu", "Nursing Room", "Playground"] if c in businesses.columns]
-if ff_raw_cols:
-    def get_ff(row):
-        vals = [parse_bool(row[c]) for c in ff_raw_cols]
-        return True if any(v is True for v in vals) else None
-    businesses["Family-Friendly"] = businesses["Family-Friendly"].apply(parse_bool).combine_first(businesses.apply(get_ff, axis=1))
+def _tf(series):
+    """Nullable-boolean Series -> (is_true, is_false) numpy bool arrays."""
+    return (
+        (series == True).fillna(False).to_numpy(dtype=bool),   # noqa: E712
+        (series == False).fillna(False).to_numpy(dtype=bool),  # noqa: E712
+    )
 
-lgbt_raw_cols = [c for c in ["Transgender Safe Space", "Gender-Neutral Toilets", "LGBTQ+ Friendly"] if c in businesses.columns]
-if lgbt_raw_cols:
-    def get_lgbt(row):
-        safe_space = parse_bool(row.get("Transgender Safe Space"))
-        lgbt_friendly = parse_bool(row.get("LGBTQ+ Friendly"))
-        if safe_space is True or lgbt_friendly is True or parse_bool(row.get("Gender-Neutral Toilets")) is True:
-            return True
-        if safe_space is False or lgbt_friendly is False:
-            return False
-        return None
-    businesses["LGBTQ+ Friendly (Likely)"] = businesses["LGBTQ+ Friendly (Likely)"].apply(parse_bool).combine_first(businesses.apply(get_lgbt, axis=1))
+
+def to_bool_series(series):
+    """Vectorised equivalent of series.apply(parse_bool)."""
+    text = series.astype("string").str.strip().str.lower()
+    return _from_tf(
+        text.isin(_TRUE_STRINGS).to_numpy(dtype=bool),
+        text.isin(_FALSE_STRINGS).to_numpy(dtype=bool),
+        series.index,
+    )
+
+
+def flag_mask(series):
+    """Boolean numpy mask: True only where the flag is definitely True (unknown -> False)."""
+    return (series == True).fillna(False).to_numpy(dtype=bool)  # noqa: E712
+
+
+def normalise_flags(df):
+    idx = df.index
+    n = len(df)
+
+    def col(name):
+        if name in df.columns:
+            return to_bool_series(df[name])
+        return pd.Series(pd.array([pd.NA] * n, dtype="boolean"), index=idx)
+
+    def combine(existing_name, derived):
+        # Keep an explicit value already in the column; fill the unknowns from the derived value.
+        return col(existing_name).combine_first(derived)
+
+    # Wheelchair Accessible (Likely): any True -> True; otherwise any False -> False; else unknown
+    wt = np.zeros(n, dtype=bool)
+    wf = np.zeros(n, dtype=bool)
+    for c in WHEELCHAIR_COLS:
+        t, f = _tf(col(c))
+        wt |= t
+        wf |= f
+    w_likely = _from_tf(wt, ~wt & wf, idx)
+    df["Wheelchair Accessible (Likely)"] = combine("Wheelchair Accessible (Likely)", w_likely)
+
+    # Quiet
+    if "Quiet" in df.columns:
+        df["Sensory Sensitivity (Quiet)"] = col("Quiet")
+    else:
+        df["Sensory Sensitivity (Quiet)"] = col("Sensory Sensitivity (Quiet)")
+
+    # Loud: any of the raw loud columns True -> True, else unknown
+    loud_raw_cols = [c for c in ["Dancing", "Karaoke", "Live-Music", "Live-Performances", "Live Music", "Live Performances"] if c in df.columns]
+    lt = np.zeros(n, dtype=bool)
+    for c in loud_raw_cols:
+        lt |= _tf(col(c))[0]
+    df["Sensory Sensitivity (Loud)"] = combine("Sensory Sensitivity (Loud)", _from_tf(lt, np.zeros(n, dtype=bool), idx))
+
+    # Family-Friendly: any of the raw kid columns True -> True, else unknown
+    ff_raw_cols = [c for c in ["Good For Kids", "Good For Kids Birthday", "Has Changing Table(S)", "Has Changing Table",
+                               "Highchairs", "Kid-Friendly activities", "Kid's Menu", "Kids Menu", "Nursing Room", "Playground"] if c in df.columns]
+    ft = np.zeros(n, dtype=bool)
+    for c in ff_raw_cols:
+        ft |= _tf(col(c))[0]
+    df["Family-Friendly"] = combine("Family-Friendly", _from_tf(ft, np.zeros(n, dtype=bool), idx))
+
+    # LGBTQ+ Friendly (Likely): safe space / friendly / gender-neutral toilets True -> True;
+    # otherwise safe space or friendly explicitly False -> False; else unknown
+    ss_t, ss_f = _tf(col("Transgender Safe Space"))
+    lf_t, lf_f = _tf(col("LGBTQ+ Friendly"))
+    gn_t, _ = _tf(col("Gender-Neutral Toilets"))
+    lt_any = ss_t | lf_t | gn_t
+    df["LGBTQ+ Friendly (Likely)"] = combine("LGBTQ+ Friendly (Likely)", _from_tf(lt_any, ~lt_any & (ss_f | lf_f), idx))
+
+    # Raw hearing-loop column is filtered on directly, so convert it too.
+    df["Assistive Hearing Loop"] = col("Assistive Hearing Loop")
+    return df
+
+
+businesses = normalise_flags(businesses)
 
 for cat_col in ["Industry", "Category", "Suburb", "Council Area"]:
     businesses[cat_col] = businesses[cat_col].astype("category")
 
-# ── Spatial Distance & Similarity Precomputation ──────────────────────────────
-def compute_geo_similarity(df):
-    """Calculates spatial similarity (0 to 1) based on physical distance in km."""
-    lats = pd.to_numeric(df["Latitude"], errors="coerce").fillna(0).values
-    lons = pd.to_numeric(df["Longitude"], errors="coerce").fillna(0).values
-    
-    rad_lats = np.radians(lats)
-    rad_lons = np.radians(lons)
-    
-    dlat = rad_lats[:, None] - rad_lats[None, :]
-    dlon = rad_lons[:, None] - rad_lons[None, :]
-    
-    a = np.sin(dlat / 2.0)**2 + np.cos(rad_lats[:, None]) * np.cos(rad_lats[None, :]) * np.sin(dlon / 2.0)**2
-    km_matrix = 6371.0 * (2 * np.arcsin(np.sqrt(a)))
-    
-    return 1.0 / (1.0 + (km_matrix / 1.0))
+# ── Similar businesses (computed on demand) ───────────────────────────────────
+# Instead of an N x N matrix (29 GB per matrix at 60k rows), each lookup scores one
+# business against all others with vectorised NumPy: O(N) time, O(N) memory (~a few MB).
+# Score = 30% same Industry + 30% same Category + 30% proximity + 10% review-count closeness.
+SIM_W_INDUSTRY = 0.30
+SIM_W_CATEGORY = 0.30
+SIM_W_GEO = 0.30
+SIM_W_REVIEWS = 0.10
+
+# Coordinates and review counts aren't editable in the dashboard, so precompute them once.
+_LAT_RAD = np.radians(pd.to_numeric(businesses["Latitude"], errors="coerce").to_numpy(dtype=float))
+_LON_RAD = np.radians(pd.to_numeric(businesses["Longitude"], errors="coerce").to_numpy(dtype=float))
+_COS_LAT = np.cos(_LAT_RAD)
+
+# Review closeness: log-scale first (review counts are extremely skewed), then scale to 0..1,
+# so 12 vs 20 reviews counts as close and 12 vs 2,000 does not.
+_rev_log = np.log1p(np.clip(pd.to_numeric(businesses["Reviews Count"], errors="coerce").fillna(0).to_numpy(dtype=float), 0, None))
+_REV_SCALED = _rev_log / _rev_log.max() if _rev_log.size and _rev_log.max() > 0 else np.zeros_like(_rev_log)
 
 
-def compute_similarity_matrix(df):
-    # 1. Industry (30% Weight)
-    ind_df = pd.get_dummies(df[["Industry"]].astype(str), dtype=float)
-    ind_norm = ind_df / np.sqrt(ind_df.shape[1]) if ind_df.shape[1] > 0 else ind_df
-    ind_sim = cosine_similarity(ind_norm)
-    
-    # 2. Category (30% Weight)
-    cat_df = pd.get_dummies(df[["Category"]].astype(str), dtype=float)
-    cat_norm = cat_df / np.sqrt(cat_df.shape[1]) if cat_df.shape[1] > 0 else cat_df
-    cat_sim = cosine_similarity(cat_norm)
-        
-    # 3. Geo Proximity / Location (30% Weight)
-    geo_sim = compute_geo_similarity(df)
+def _same_value(series, i):
+    """Bool array: True where the row has the same (non-blank) value as row i.
+    Reads the live column, so Industry/Category edits made in the dashboard count immediately."""
+    target = series.iloc[i]
+    if pd.isna(target) or not str(target).strip():
+        return np.zeros(len(series), dtype=bool)
+    return (series == target).to_numpy(dtype=bool)
 
-    # 4. Reviews Count (10% Weight)
-    scaler = MinMaxScaler()
-    revs = pd.to_numeric(df["Reviews Count"], errors="coerce").fillna(0).values.reshape(-1, 1)
-    rev_df = pd.DataFrame(scaler.fit_transform(revs), columns=["Reviews Count"], index=df.index)
-    rev_sim = cosine_similarity(rev_df)
 
-    # Combined matrix with requested 30/30/30/10 weights
-    return (0.30 * ind_sim) + (0.30 * cat_sim) + (0.30 * geo_sim) + (0.10 * rev_sim)
+def _geo_similarity_to(i):
+    """1 / (1 + km) from business i to every business. Missing coordinates score 0."""
+    dlat = _LAT_RAD - _LAT_RAD[i]
+    dlon = _LON_RAD - _LON_RAD[i]
+    a = np.sin(dlat / 2.0) ** 2 + _COS_LAT[i] * _COS_LAT * np.sin(dlon / 2.0) ** 2
+    km = 6371.0 * 2.0 * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
+    sim = 1.0 / (1.0 + km)
+    return np.where(np.isfinite(sim), sim, 0.0)
 
-SIMILARITY_MATRIX = compute_similarity_matrix(businesses)
+
+def _review_similarity_to(i):
+    return 1.0 - np.abs(_REV_SCALED - _REV_SCALED[i])
+
+
+def similarity_scores(i):
+    """Similarity (0..1) of the business at position i to every business."""
+    return (
+        SIM_W_INDUSTRY * _same_value(businesses["Industry"], i)
+        + SIM_W_CATEGORY * _same_value(businesses["Category"], i)
+        + SIM_W_GEO * _geo_similarity_to(i)
+        + SIM_W_REVIEWS * _review_similarity_to(i)
+    )
+
 
 def get_top_similar(row_idx, top_n=3):
-    scores = list(enumerate(SIMILARITY_MATRIX[row_idx]))
-    scores = sorted(scores, key=lambda x: x[1], reverse=True)
-    top_items = []
-    for idx, score in scores:
-        if idx != row_idx:
-            top_items.append((idx, score))
-        if len(top_items) == top_n:
-            break
-    return top_items
+    """Returns [(row_index, score), ...] best first, excluding the business itself."""
+    i = businesses.index.get_loc(row_idx)
+    scores = similarity_scores(i)
+    scores[i] = -np.inf
+    k = min(top_n, len(scores) - 1)
+    if k <= 0:
+        return []
+    cand = np.argpartition(-scores, k - 1)[:k]
+    cand = cand[np.lexsort((cand, -scores[cand]))]  # best score first, ties by row order
+    return [(int(businesses.index[j]), float(scores[j])) for j in cand]
 
 # ── Filter Options Configuration ─────────────────────────────────────────────
 def make_options(values):
@@ -314,7 +383,7 @@ def get_filter_masks(data, search=None, industry=None, category=None, council_ar
         acc_mask = np.ones(len(data), dtype=bool)
         for feature in accessibility:
             if feature in data.columns:
-                acc_mask &= (data[feature].apply(parse_bool) == True)
+                acc_mask &= flag_mask(data[feature])
         masks["accessibility"] = acc_mask
     else:
         masks["accessibility"] = np.ones(len(data), dtype=bool)
@@ -345,7 +414,7 @@ def get_filter_masks(data, search=None, industry=None, category=None, council_ar
 def compute_accessibility_options(data):
     opts = []
     for f in ADVANCED_OPTIONS_FEATURES:
-        if f in data.columns and (data[f].apply(parse_bool) == True).any():
+        if f in data.columns and flag_mask(data[f]).any():
             opts.append({"label": f, "value": f})
     return opts
 
