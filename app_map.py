@@ -772,8 +772,26 @@ MAP_MARKER_FAV_COLOR = "#FF8C00"   # Keystone orange, for favourited businesses
 DEFAULT_MAP_CENTER = {"lat": -37.8136, "lon": 144.9631}  # Melbourne CBD fallback
 
 
-def _build_map_figure(map_df):
-    """Build a Scattermapbox figure for the given (already-filtered) businesses dataframe."""
+MAP_CLUSTER_MIN = 100          # Only areas with this many businesses (or more) become a cluster bubble
+MAP_CLUSTER_CELL_PX = 80       # Size of the grouping cell, in screen pixels, at the current zoom
+MAP_CLUSTER_COLOR = "#66F2E3"  # Keystone light blue
+MAP_DEFAULT_ZOOM = 10.5
+
+
+def _cluster_cells(lat, lon, zoom):
+    """Assign each point to a square screen-pixel cell at the given zoom (Web Mercator)."""
+    scale = 256 * (2 ** zoom)
+    x = (lon.to_numpy(dtype=float) + 180.0) / 360.0 * scale
+    lat_rad = np.radians(np.clip(lat.to_numpy(dtype=float), -85.0, 85.0))
+    y = (1.0 - np.log(np.tan(lat_rad) + 1.0 / np.cos(lat_rad)) / np.pi) / 2.0 * scale
+    cx = np.floor(x / MAP_CLUSTER_CELL_PX).astype(np.int64)
+    cy = np.floor(y / MAP_CLUSTER_CELL_PX).astype(np.int64)
+    return cx * 1_000_003 + cy
+
+
+def _build_map_figure(map_df, center=None, zoom=None):
+    """Scattermapbox figure: a light-blue bubble only where 100+ businesses sit in the same
+    screen area; everywhere else, individual purple (or orange if favourited) dots."""
     lat = pd.to_numeric(map_df["Latitude"], errors="coerce")
     lon = pd.to_numeric(map_df["Longitude"], errors="coerce")
     valid = lat.notna() & lon.notna()
@@ -781,34 +799,64 @@ def _build_map_figure(map_df):
     lat = lat.loc[valid]
     lon = lon.loc[valid]
 
+    # Default center/zoom if the user hasn't panned or zoomed yet
+    if center is None:
+        if len(map_df) > 0:
+            center = {"lat": float(lat.mean()), "lon": float(lon.mean())}
+        else:
+            center = DEFAULT_MAP_CENTER
+
+    if zoom is None:
+        zoom = MAP_DEFAULT_ZOOM if len(map_df) else 9
+
+    fig = go.Figure()
+
     if len(map_df) > 0:
-        center = {"lat": float(lat.mean()), "lon": float(lon.mean())}
-    else:
-        center = DEFAULT_MAP_CENTER
+        cell = pd.Series(_cluster_cells(lat, lon, float(zoom)), index=map_df.index)
+        cell_size = cell.map(cell.value_counts())
+        in_cluster = cell_size >= MAP_CLUSTER_MIN
 
-    colors = [MAP_MARKER_FAV_COLOR if fav else MAP_MARKER_COLOR for fav in map_df.get("_is_fav", pd.Series(False, index=map_df.index))]
-
-    fig = go.Figure(
-        go.Scattermapbox(
-            lat=lat,
-            lon=lon,
+        # Individual dots (every business NOT in a 100+ area)
+        dots = map_df.loc[~in_cluster]
+        is_fav = dots.get("_is_fav", pd.Series(False, index=dots.index))
+        fig.add_trace(go.Scattermapbox(
+            lat=lat.loc[dots.index],
+            lon=lon.loc[dots.index],
             mode="markers",
             marker=dict(
                 size=MAP_MARKER_BASE_SIZE,
-                color=colors,
+                color=[MAP_MARKER_FAV_COLOR if f else MAP_MARKER_COLOR for f in is_fav],
                 opacity=0.9,
             ),
-            text=map_df["Business Name"],
-            customdata=map_df.index.to_list(),
+            text=dots["Business Name"],
+            customdata=dots.index.to_list(),
             hovertemplate="%{text}<extra></extra>",
-        )
-    )
+        ))
+
+        # Cluster bubbles (only cells with 100+ businesses)
+        if in_cluster.any():
+            grp = pd.DataFrame({
+                "lat": lat.loc[in_cluster], "lon": lon.loc[in_cluster], "cell": cell.loc[in_cluster],
+            }).groupby("cell").agg(lat=("lat", "mean"), lon=("lon", "mean"), n=("lat", "size"))
+            fig.add_trace(go.Scattermapbox(
+                lat=grp["lat"],
+                lon=grp["lon"],
+                mode="markers+text",
+                marker=dict(
+                    size=(32 + 8 * np.log10(grp["n"] / MAP_CLUSTER_MIN)).clip(upper=56),
+                    color=MAP_CLUSTER_COLOR,
+                    opacity=0.95,
+                ),
+                text=grp["n"].astype(str),
+                textfont=dict(size=12, color="#1A0A3D"),
+                hoverinfo="skip",
+            ))
 
     fig.update_layout(
         mapbox=dict(
             style="white-bg",
             center=center,
-            zoom=10.5 if len(map_df) else 9,
+            zoom=zoom,
             layers=[{
                 "below": "traces",
                 "sourcetype": "raster",
@@ -817,7 +865,7 @@ def _build_map_figure(map_df):
         ),
         margin=dict(l=0, r=0, t=0, b=0),
         showlegend=False,
-        uirevision="keystone-map",
+        uirevision="keystone-map",       # Preserves UI view state between updates
         paper_bgcolor="#F8F5FF",
     )
     return fig
@@ -984,11 +1032,11 @@ dashboard_layout = html.Div(
                     children=[
                         # ✨ Ask Claude (plain-English -> filters)
                         html.Div(
-                            style={"background": "#F8F5FF", "border": "1px solid #D9CCFF", "borderRadius": "14px", "padding": "18px", "marginBottom": "22px"},
+                            style={"background": "#F8F5FF", "border": "1px solid #D9CCFF", "borderRadius": "14px", "padding": "12px 18px", "marginBottom": "18px"},
                             children=[
                                 html.Label("✨ Ask Claude", style={"fontWeight": "bold", "color": "#2E1654"}),
                                 html.Div(
-                                    style={"display": "flex", "gap": "10px", "marginTop": "8px"},
+                                    style={"display": "flex", "gap": "10px", "marginTop": "6px"},
                                     children=[
                                         dcc.Input(
                                             id="ai-input", type="text", n_submit=0, maxLength=AI_MAX_QUERY_CHARS,
@@ -1001,8 +1049,13 @@ dashboard_layout = html.Div(
                                         ),
                                     ],
                                 ),
-                                dcc.Loading(type="dot", color="#4200A8", children=html.Div(id="ai-status", style={"marginTop": "12px", "minHeight": "20px"})),
-                                html.Small(AI_EXAMPLES + " Please don't type a participant's name or personal details.", style={"color": "#6F5A8C"}),
+                                # Hint sits directly under the input, indented to line up with the placeholder text
+                                # (the placeholder renders ~22px in from the input's left edge, so 23px incl. the box border).
+                                html.Small(
+                                    AI_EXAMPLES + " Please don't type a participant's name or personal details.",
+                                    style={"display": "block", "color": "#6F5A8C", "marginTop": "4px", "paddingLeft": "23px"},
+                                ),
+                                dcc.Loading(type="dot", color="#4200A8", children=html.Div(id="ai-status", style={"marginTop": "4px", "minHeight": "0", "paddingLeft": "23px"})),
                             ],
                         ),
 
@@ -1098,7 +1151,8 @@ dashboard_layout = html.Div(
                                 ),
                             ],
                         ),
-                        dcc.Store(id="view-mode-store", data="table")
+                        dcc.Store(id="view-mode-store", data="table"),
+                        dcc.Store(id="map-zoom-store", data=None)
                     ],
                 ),
             ],
@@ -1515,6 +1569,7 @@ def toggle_view_mode(_table_clicks, _map_clicks):
 
 @app.callback(
     Output("business-map", "figure"),
+    Output("map-zoom-store", "data"),
     Input("search-input", "value"),
     Input({"type": "msf-checklist", "index": "industry"}, "value"),
     Input({"type": "msf-checklist", "index": "category"}, "value"),
@@ -1525,8 +1580,27 @@ def toggle_view_mode(_table_clicks, _map_clicks):
     Input("favourites-toggle-store", "data"),
     Input("fav-update-trigger", "data"),
     Input("edit-save-trigger", "data"),
+    Input("business-map", "relayoutData"),
+    State("map-zoom-store", "data"),
 )
-def update_map_figure(search, industry, category, council_area, suburb, accessibility, review_count, fav_only, _trig, _edit):
+def update_map_figure(search, industry, category, council_area, suburb, accessibility, review_count, fav_only, _trig, _edit, relayout, last_zoom):
+    # Panning never needs a rebuild (clusters only depend on zoom), so the map moves freely.
+    # Only rebuild when the zoom level actually changed, or when a filter triggered this.
+    zoom = last_zoom
+    if isinstance(relayout, dict) and relayout.get("mapbox.zoom") is not None:
+        zoom = float(relayout["mapbox.zoom"])
+    # Keep the rebuilt figure at the position the user panned to (don't snap back to the data centre)
+    view_center = None
+    if isinstance(relayout, dict):
+        c = relayout.get("mapbox.center")
+        if isinstance(c, dict) and "lat" in c and "lon" in c:
+            view_center = {"lat": float(c["lat"]), "lon": float(c["lon"])}
+        elif "mapbox.center.lat" in relayout and "mapbox.center.lon" in relayout:
+            view_center = {"lat": float(relayout["mapbox.center.lat"]), "lon": float(relayout["mapbox.center.lon"])}
+    if ctx.triggered_id == "business-map":
+        if zoom is None or (last_zoom is not None and abs(zoom - float(last_zoom)) < 0.01):
+            raise PreventUpdate
+
     if not industry:
         category = []
     if not council_area:
@@ -1543,7 +1617,7 @@ def update_map_figure(search, industry, category, council_area, suburb, accessib
         masks["review_count"] & masks["favourites"]
     )
     map_df = businesses[combined_all]
-    return _build_map_figure(map_df)
+    return _build_map_figure(map_df, center=view_center, zoom=zoom), zoom
 
 
 # One-time (per graph node) clientside binding of hover/unhover so a dot enlarges
