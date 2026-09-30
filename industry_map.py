@@ -1,5 +1,7 @@
 import re
 
+import pandas as pd
+
 
 INDUSTRY_MAP = {
     "car_dealer": "Automotive",
@@ -515,12 +517,113 @@ KEYWORD_SECTORS = [
 KEYWORD_SECTORS.sort(key=lambda pair: len(pair[0]), reverse=True)
 
 
-def derive_industry(category_value):
-    norm = normalize(category_value)
-    key = to_key(norm)
-    if key in INDUSTRY_MAP:
-        return INDUSTRY_MAP[key]
+EXTRA_KEYWORD_SECTORS = [
+    ("attorney", "Services"), ("lawyer", "Services"), ("barrister", "Services"), ("solicitor", "Services"),
+    ("conveyancer", "Services"), ("notary", "Services"), ("law firm", "Services"), ("legal", "Services"),
+    ("construction", "Services"), ("building", "Services"), ("carpenter", "Services"), ("joiner", "Services"),
+    ("bricklayer", "Services"), ("plasterer", "Services"), ("landscaper", "Services"), ("handyman", "Services"),
+    ("painting", "Services"), ("welder", "Services"), ("surveyor", "Services"), ("surveying", "Services"),
+    ("inspector", "Services"), ("installer", "Services"), ("earth works", "Services"), ("height works", "Services"),
+    ("shopfitter", "Services"), ("maintenance", "Services"), ("home help", "Services"), ("decorator", "Services"),
+    ("architecture", "Services"), ("engineering", "Services"), ("automation", "Services"),
+    ("appraiser", "Services"), ("auction", "Services"), ("auctioneer", "Services"), ("liquidator", "Services"),
+    ("coach", "Services"), ("organizer", "Services"), ("organiser", "Services"), ("planner", "Services"),
+    ("celebrant", "Services"), ("stylist", "Services"), ("salon", "Services"), ("groomer", "Services"),
+    ("dog trainer", "Services"), ("veterinarian", "Services"), ("laundromat", "Services"), ("recycling", "Services"),
+    ("redemption", "Services"), ("junkyard", "Services"), ("mover", "Services"), ("machinery hire", "Services"),
+    ("media", "Services"), ("public relations", "Services"), ("advertising", "Services"), ("marketing", "Services"),
+    ("software", "Services"), ("telephone", "Services"), ("telecommunications", "Services"), ("cable company", "Services"),
+    ("hosting", "Services"), ("database", "Services"), ("data center", "Services"), ("server", "Services"),
+    ("call center", "Services"), ("bpo", "Services"), ("closed circuit television", "Services"), ("locker", "Services"),
+    ("photo lab", "Services"), ("employment", "Services"), ("conference", "Services"), ("exhibition", "Services"),
+    ("function room", "Services"), ("occupational safety", "Services"), ("association", "Services"),
+    ("chamber of commerce", "Services"), ("networking", "Services"), ("foundation", "Services"),
+    ("agent", "Services"), ("real estate", "Services"), ("property", "Services"), ("insurance", "Services"),
+    ("accountant", "Finance"), ("accounting", "Finance"), ("auditor", "Finance"), ("tax", "Finance"),
+    ("financial", "Finance"), ("finance", "Finance"), ("investment", "Finance"), ("mortgage", "Finance"),
+    ("loan", "Finance"), ("lender", "Finance"), ("venture capital", "Finance"), ("stock exchange", "Finance"),
+    ("title company", "Finance"), ("adjuster", "Finance"),
+    ("fabricator", "Business & manufacturing"), ("fabrication", "Business & manufacturing"),
+    ("factory", "Business & manufacturing"), ("mill", "Business & manufacturing"), ("foundry", "Business & manufacturing"),
+    ("iron works", "Business & manufacturing"), ("industry", "Business & manufacturing"),
+    ("industrial", "Business & manufacturing"), ("processing", "Business & manufacturing"),
+    ("producer", "Business & manufacturing"), ("manufacturing", "Business & manufacturing"),
+    ("maker", "Business & manufacturing"), ("woodworker", "Business & manufacturing"),
+    ("engraver", "Business & manufacturing"), ("silversmith", "Business & manufacturing"),
+    ("glass blower", "Business & manufacturing"), ("bookbinder", "Business & manufacturing"),
+    ("stone cutter", "Business & manufacturing"), ("toolroom", "Business & manufacturing"),
+    ("workshop", "Business & manufacturing"), ("importer", "Business & manufacturing"),
+    ("exporter", "Business & manufacturing"), ("import", "Business & manufacturing"),
+    ("distributor", "Business & manufacturing"),
+    ("export", "Business & manufacturing"), ("packaging", "Business & manufacturing"),
+    ("warehouse", "Business & manufacturing"), ("corporate", "Business & manufacturing"),
+    ("business park", "Business & manufacturing"),
+    ("office rental", "Business & manufacturing"), ("business related", "Business & manufacturing"),
+    ("plant", "Business & manufacturing"),
+    ("mining", "Business & manufacturing"), ("chemical", "Business & manufacturing"),
+    ("pharmaceutical", "Business & manufacturing"), ("biotechnology", "Business & manufacturing"),
+    ("research", "Business & manufacturing"), ("energy", "Business & manufacturing"),
+    ("solar", "Business & manufacturing"), ("renewable", "Business & manufacturing"),
+    ("petroleum", "Business & manufacturing"), ("electronics", "Business & manufacturing"),
+    ("equipment", "Business & manufacturing"), ("steel", "Business & manufacturing"),
+    ("metal", "Business & manufacturing"), ("aluminum", "Business & manufacturing"),
+    ("farm", "Business & manufacturing"), ("livestock", "Business & manufacturing"),
+    ("breeder", "Business & manufacturing"), ("dairy", "Business & manufacturing"),
+    ("agricultural", "Business & manufacturing"), ("textile", "Business & manufacturing"),
+    ("garment", "Business & manufacturing"), ("sewing", "Business & manufacturing"),
+    ("shipyard", "Business & manufacturing"), ("shipbuilding", "Business & manufacturing"),
+    ("model design", "Business & manufacturing"),
+    ("utility", "Facilities"), ("power station", "Facilities"), ("power plant", "Facilities"),
+    ("treatment plant", "Facilities"), ("filtration plant", "Facilities"), ("gas company", "Facilities"),
+    ("bicycle rack", "Facilities"),
+    ("council", "Government"), ("government", "Government"), ("department", "Government"),
+    ("registry office", "Government"), ("registration office", "Government"), ("tax collector", "Government"),
+    ("unemployment office", "Government"), ("passport", "Government"), ("military", "Government"),
+    ("sanitary inspection", "Government"), ("consumer advice", "Government"),
+    ("pathologist", "Health & wellness"), ("psychologist", "Health & wellness"),
+    ("neuropsychologist", "Health & wellness"), ("psychotherapist", "Health & wellness"),
+    ("counselor", "Health & wellness"), ("counsellor", "Health & wellness"), ("therapist", "Health & wellness"),
+    ("therapy", "Health & wellness"), ("osteopath", "Health & wellness"), ("podiatrist", "Health & wellness"),
+    ("dietitian", "Health & wellness"), ("nutritionist", "Health & wellness"), ("naturopathic", "Health & wellness"),
+    ("acupuncture", "Health & wellness"), ("kinesiologist", "Health & wellness"), ("medical", "Health & wellness"),
+    ("medicine", "Health & wellness"), ("clinic", "Health & wellness"), ("surgeon", "Health & wellness"),
+    ("surgical", "Health & wellness"), ("x ray", "Health & wellness"), ("diagnostic", "Health & wellness"),
+    ("practitioner", "Health & wellness"), ("nurse", "Health & wellness"), ("optician", "Health & wellness"),
+    ("wellness", "Health & wellness"), ("health", "Health & wellness"), ("dental", "Health & wellness"),
+    ("diabetes", "Health & wellness"), ("family planning", "Health & wellness"), ("laboratory", "Health & wellness"),
+    ("apartment", "Housing"), ("house", "Housing"), ("retirement community", "Housing"), ("display home", "Housing"),
+    ("vacation rental", "Lodging"),
+    ("trucking", "Transportation"), ("bus", "Transportation"), ("airline", "Transportation"),
+    ("aviation", "Transportation"), ("railroad", "Transportation"), ("port", "Transportation"),
+    ("container terminal", "Transportation"), ("car sharing", "Transportation"),
+    ("vehicle shipping", "Transportation"), ("transporter", "Transportation"), ("logistics", "Transportation"),
+    ("car", "Automotive"), ("auto", "Automotive"), ("auto painting", "Automotive"),
+    ("car inspection", "Automotive"), ("vehicle", "Automotive"),
+    ("artist", "Culture & arts"), ("publisher", "Culture & arts"), ("newspaper", "Culture & arts"),
+    ("record company", "Culture & arts"), ("recording studio", "Culture & arts"), ("music", "Culture & arts"),
+    ("music producer", "Culture & arts"), ("musician", "Culture & arts"), ("band", "Culture & arts"),
+    ("film", "Culture & arts"), ("movie", "Culture & arts"), ("animation", "Culture & arts"),
+    ("theater", "Culture & arts"), ("theatre", "Culture & arts"), ("broadcaster", "Culture & arts"),
+    ("portrait studio", "Culture & arts"), ("heritage", "Culture & arts"), ("handicraft", "Culture & arts"),
+    ("entertainer", "Entertainment & recreation"), ("photo booth", "Entertainment & recreation"),
+    ("outdoor activity", "Entertainment & recreation"),
+    ("gym", "Sports & fitness"), ("fitness", "Sports & fitness"), ("pilates", "Sports & fitness"),
+    ("boxing", "Sports & fitness"), ("trainer", "Sports & fitness"), ("personal trainer", "Sports & fitness"),
+    ("instructor", "Sports & fitness"), ("equestrian", "Sports & fitness"),
+    ("coaching", "Education"), ("learning", "Education"), ("tutor", "Education"),
+    ("apprenticeship", "Education"), ("student", "Education"),
+    ("newsstand", "Shopping"), ("mall", "Shopping"), ("showroom", "Shopping"), ("clothing", "Shopping"),
+    ("lottery", "Shopping"), ("retailer", "Shopping"), ("buyer", "Shopping"), ("jewelry", "Shopping"),
+    ("plant nursery", "Shopping"), ("vending machine", "Shopping"),
+    ("food", "Food & drink"), ("patisserie", "Food & drink"), ("wine", "Food & drink"),
+    ("mineral water", "Food & drink"),
+    ("priest", "Places of worship"), ("kingdom hall", "Places of worship"),
+]
+EXTRA_KEYWORD_SECTORS.sort(key=lambda pair: len(pair[0]), reverse=True)
+GENERIC_BUSINESS_WORDS = {"company", "office", "firm", "business"}
 
+
+def _keyword_sector(norm):
     words = set(norm.split())
     for phrase, sector in KEYWORD_SECTORS:
         if " " in phrase:
@@ -529,10 +632,48 @@ def derive_industry(category_value):
         else:
             if phrase in words:
                 return sector
+    return None
+
+
+def _extra_keyword_sector(norm):
+    norm = norm.replace("'s ", " ").replace("'", "")
+    words = set(norm.split())
+    words |= {w[:-1] for w in words if len(w) > 3 and w.endswith("s")}
+    padded = f" {norm} "
+    for phrase, sector in EXTRA_KEYWORD_SECTORS:
+        if " " in phrase:
+            if f" {phrase} " in padded:
+                return sector
+        elif phrase in words:
+            return sector
+    if words & GENERIC_BUSINESS_WORDS:
+        return "Business & manufacturing"
+    return None
+
+
+def derive_industry(category_value, business_name=None):
+    norm = normalize(category_value) if pd.notna(category_value) else ""
+    key = to_key(norm)
+    if key in INDUSTRY_MAP:
+        return INDUSTRY_MAP[key]
+
+    sector = _keyword_sector(norm)
+    if sector:
+        return sector
 
     for map_key, sector in INDUSTRY_MAP.items():
         map_phrase = map_key.replace("_", " ")
-        if map_phrase in norm and len(map_phrase) > 4:
+        if norm and map_phrase in norm and len(map_phrase) > 4:
+            return sector
+
+    sector = _extra_keyword_sector(norm)
+    if sector:
+        return sector
+
+    if business_name is not None and pd.notna(business_name):
+        name = normalize(business_name)
+        sector = _keyword_sector(name) or _extra_keyword_sector(name)
+        if sector:
             return sector
 
     return "Other"
