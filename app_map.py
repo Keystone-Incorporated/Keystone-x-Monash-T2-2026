@@ -6,6 +6,10 @@ import secrets
 import threading
 from datetime import datetime
 from functools import lru_cache
+import re
+import time
+import urllib.parse
+import urllib.request
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -144,9 +148,12 @@ if missing:
     raise ValueError("Missing columns: " + ", ".join(missing))
 
 # Apply industry mapping
-_placeholder_industry = {"", "hospitality", "retail"}
+_placeholder_industry = {"", "nan", "hospitality", "retail", "other"}
 _needs_industry = businesses["Industry"].astype(str).str.strip().str.lower().isin(_placeholder_industry)
-businesses.loc[_needs_industry, "Industry"] = businesses.loc[_needs_industry, "Category"].apply(derive_industry)
+businesses.loc[_needs_industry, "Industry"] = [
+    derive_industry(category, name)
+    for category, name in zip(businesses.loc[_needs_industry, "Category"], businesses.loc[_needs_industry, "Business Name"])
+]
 
 businesses["_search_name"] = businesses["Business Name"].astype(str).str.lower()
 fav_initial_set = load_favourites()
@@ -298,6 +305,95 @@ _COS_LAT = np.cos(_LAT_RAD)
 _rev_log = np.log1p(np.clip(pd.to_numeric(businesses["Reviews Count"], errors="coerce").fillna(0).to_numpy(dtype=float), 0, None))
 _REV_SCALED = _rev_log / _rev_log.max() if _rev_log.size and _rev_log.max() > 0 else np.zeros_like(_rev_log)
 
+PROXIMITY_RADIUS_OPTIONS = [1, 2, 5, 10, 20]
+PROXIMITY_DEFAULT_RADIUS = 5
+PROXIMITY_ZOOM = {1: 13.5, 2: 12.5, 5: 11.3, 10: 10.3, 20: 9.3}
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+GEOCODER_USER_AGENT = os.getenv("GEOCODER_USER_AGENT", "KeystoneEmployerDashboard/1.0")
+VIC_VIEWBOX = "140.9,-33.9,150.1,-39.3"
+
+
+def distance_km_from(data, lat, lon):
+    lat_arr = np.radians(pd.to_numeric(data["Latitude"], errors="coerce").to_numpy(dtype=float))
+    lon_arr = np.radians(pd.to_numeric(data["Longitude"], errors="coerce").to_numpy(dtype=float))
+    lat0, lon0 = np.radians(float(lat)), np.radians(float(lon))
+    a = np.sin((lat_arr - lat0) / 2.0) ** 2 + np.cos(lat0) * np.cos(lat_arr) * np.sin((lon_arr - lon0) / 2.0) ** 2
+    return 6371.0 * 2.0 * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
+
+
+_suburb_geo = businesses[["Suburb", "Latitude", "Longitude"]].copy()
+_suburb_geo["Suburb"] = _suburb_geo["Suburb"].astype(str).str.strip()
+_suburb_geo = _suburb_geo[(_suburb_geo["Suburb"] != "") & _suburb_geo["Latitude"].notna() & _suburb_geo["Longitude"].notna()]
+SUBURB_CENTROIDS = {
+    name: (float(g["Latitude"].median()), float(g["Longitude"].median()))
+    for name, g in _suburb_geo.groupby("Suburb", observed=True)
+}
+_SUBURB_PATTERNS = [
+    (name, re.compile(rf"(?<![a-z]){re.escape(name.lower())}(?![a-z])"))
+    for name in SUBURB_CENTROIDS
+]
+
+_GEOCODE_CACHE = {}
+_GEOCODE_CACHE_MAX = 512
+_GEOCODE_LOCK = threading.Lock()
+_GEOCODE_LAST_CALL = [0.0]
+
+
+def _nominatim_lookup(query):
+    key = query.lower()
+    if key in _GEOCODE_CACHE:
+        return dict(_GEOCODE_CACHE[key])
+    params = urllib.parse.urlencode({
+        "q": query, "format": "json", "limit": 1, "countrycodes": "au",
+        "viewbox": VIC_VIEWBOX, "bounded": 1,
+    })
+    req = urllib.request.Request(f"{NOMINATIM_URL}?{params}", headers={"User-Agent": GEOCODER_USER_AGENT})
+    try:
+        with _GEOCODE_LOCK:
+            wait = 1.0 - (time.monotonic() - _GEOCODE_LAST_CALL[0])
+            if wait > 0:
+                time.sleep(wait)
+            _GEOCODE_LAST_CALL[0] = time.monotonic()
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                results = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+    if not results:
+        return None
+    top = results[0]
+    try:
+        lat, lon = float(top["lat"]), float(top["lon"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    label = ", ".join(p.strip() for p in str(top.get("display_name", query)).split(",")[:4])
+    result = {"lat": lat, "lon": lon, "label": label, "approximate": False}
+    if len(_GEOCODE_CACHE) >= _GEOCODE_CACHE_MAX:
+        _GEOCODE_CACHE.pop(next(iter(_GEOCODE_CACHE)))
+    _GEOCODE_CACHE[key] = result
+    return dict(result)
+
+
+def _suburb_lookup(text):
+    lowered = text.lower()
+    best = None
+    for name, pattern in _SUBURB_PATTERNS:
+        for match in pattern.finditer(lowered):
+            rank = (match.end(), len(name))
+            if best is None or rank > best[0]:
+                best = (rank, name)
+    if best is None:
+        return None
+    name = best[1]
+    lat, lon = SUBURB_CENTROIDS[name]
+    return {"lat": lat, "lon": lon, "label": name, "approximate": True}
+
+
+def geocode_address(text):
+    text = (text or "").strip()
+    if not text:
+        return None
+    return _nominatim_lookup(text) or _suburb_lookup(text)
+
 
 def _same_value(series, i):
     """Bool array: True where the row has the same (non-blank) value as row i.
@@ -371,7 +467,7 @@ COUNCIL_OPTIONS = make_options(businesses["Council Area"].cat.categories)
 SUBURB_OPTIONS = make_options(businesses["Suburb"].cat.categories)
 
 
-def get_filter_masks(data, search=None, industry=None, category=None, council_area=None, suburb=None, accessibility=None, review_count=None, favourites_only=None):
+def get_filter_masks(data, search=None, industry=None, category=None, council_area=None, suburb=None, accessibility=None, review_count=None, favourites_only=None, proximity=None):
     masks = {}
     masks["search"] = data["_search_name"].str.contains(search.strip().lower(), regex=False) if search else np.ones(len(data), dtype=bool)
     masks["industry"] = data["Industry"].isin(industry) if industry else np.ones(len(data), dtype=bool)
@@ -408,6 +504,12 @@ def get_filter_masks(data, search=None, industry=None, category=None, council_ar
         masks["review_count"] = np.ones(len(data), dtype=bool)
 
     masks["favourites"] = (data["_is_fav"] == True) if favourites_only else np.ones(len(data), dtype=bool)
+
+    if proximity and proximity.get("lat") is not None:
+        dist = distance_km_from(data, proximity["lat"], proximity["lon"])
+        masks["proximity"] = np.nan_to_num(dist, nan=np.inf) <= float(proximity.get("radius") or PROXIMITY_DEFAULT_RADIUS)
+    else:
+        masks["proximity"] = np.ones(len(data), dtype=bool)
     return masks
 
 
@@ -761,6 +863,17 @@ def favourites_toggle():
 
 
 TABLE_COLS = ["Business Name", "Phone", "Website", "Suburb", "Industry"]
+DISTANCE_COL = "Distance (km)"
+
+
+def table_columns(with_distance=False):
+    cols = list(TABLE_COLS)
+    if with_distance:
+        cols.insert(1, DISTANCE_COL)
+    return [
+        {"name": c, "id": c, "presentation": "markdown" if c == "Website" else "input", "editable": False}
+        for c in cols
+    ] + [{"name": "_row_idx", "id": "_row_idx", "editable": False}]
 
 # ── Map view config (CARTO basemap) ───────────────────────────────────────────
 CARTO_API_KEY = os.getenv("CARTO_API_KEY", "")
@@ -789,7 +902,7 @@ def _cluster_cells(lat, lon, zoom):
     return cx * 1_000_003 + cy
 
 
-def _build_map_figure(map_df, center=None, zoom=None):
+def _build_map_figure(map_df, center=None, zoom=None, origin=None):
     """Scattermapbox figure: a light-blue bubble only where 100+ businesses sit in the same
     screen area; everywhere else, individual purple (or orange if favourited) dots."""
     lat = pd.to_numeric(map_df["Latitude"], errors="coerce")
@@ -801,7 +914,9 @@ def _build_map_figure(map_df, center=None, zoom=None):
 
     # Default center/zoom if the user hasn't panned or zoomed yet
     if center is None:
-        if len(map_df) > 0:
+        if origin and origin.get("lat") is not None:
+            center = {"lat": float(origin["lat"]), "lon": float(origin["lon"])}
+        elif len(map_df) > 0:
             center = {"lat": float(lat.mean()), "lon": float(lon.mean())}
         else:
             center = DEFAULT_MAP_CENTER
@@ -852,6 +967,22 @@ def _build_map_figure(map_df, center=None, zoom=None):
                 hoverinfo="skip",
             ))
 
+    if origin and origin.get("lat") is not None:
+        radius = float(origin.get("radius") or PROXIMITY_DEFAULT_RADIUS)
+        angles = np.linspace(0, 2 * np.pi, 73)
+        ring_lat = origin["lat"] + (radius / 111.0) * np.sin(angles)
+        ring_lon = origin["lon"] + (radius / (111.0 * np.cos(np.radians(origin["lat"])))) * np.cos(angles)
+        fig.add_trace(go.Scattermapbox(
+            lat=ring_lat, lon=ring_lon, mode="lines",
+            line=dict(width=2, color="#4200A8"), hoverinfo="skip",
+        ))
+        fig.add_trace(go.Scattermapbox(
+            lat=[origin["lat"]], lon=[origin["lon"]], mode="markers",
+            marker=dict(size=18, color="#E0452B", opacity=1.0),
+            text=[f"📍 {origin.get('label', 'Address')}"],
+            hovertemplate="%{text}<extra></extra>",
+        ))
+
     fig.update_layout(
         mapbox=dict(
             style="white-bg",
@@ -865,7 +996,7 @@ def _build_map_figure(map_df, center=None, zoom=None):
         ),
         margin=dict(l=0, r=0, t=0, b=0),
         showlegend=False,
-        uirevision="keystone-map",       # Preserves UI view state between updates
+        uirevision=f"keystone-map-{origin['lat']}-{origin['lon']}-{origin.get('radius')}" if origin else "keystone-map",       # Preserves UI view state between updates
         paper_bgcolor="#F8F5FF",
     )
     return fig
@@ -1073,6 +1204,40 @@ dashboard_layout = html.Div(
                             ],
                         ),
                         
+                        html.Div(
+                            style={"background": "#F8F5FF", "border": "1px solid #D9CCFF", "borderRadius": "14px", "padding": "18px", "marginBottom": "22px"},
+                            children=[
+                                html.Label("📍 Near an address", style={"fontWeight": "bold", "color": "#2E1654"}),
+                                html.Div(
+                                    style={"display": "flex", "gap": "10px", "marginTop": "8px", "flexWrap": "wrap"},
+                                    children=[
+                                        dcc.Input(
+                                            id="proximity-address", type="text", n_submit=0, maxLength=200,
+                                            placeholder="Enter an address or suburb, e.g. Wellington Rd, Clayton",
+                                            style={"flex": "1", "minWidth": "240px", "padding": "14px", "borderRadius": "10px", "border": "1px solid #CCCCCC", "fontSize": "16px", "height": "48px"},
+                                        ),
+                                        dcc.Dropdown(
+                                            id="proximity-radius", clearable=False, searchable=False,
+                                            value=PROXIMITY_DEFAULT_RADIUS,
+                                            options=[{"label": f"Within {r} km", "value": r} for r in PROXIMITY_RADIUS_OPTIONS],
+                                            style={"width": "160px", "alignSelf": "center"},
+                                        ),
+                                        html.Button(
+                                            "Find nearby", id="proximity-submit-btn", n_clicks=0,
+                                            style={"height": "48px", "padding": "0 22px", "border": "none", "borderRadius": "10px", "backgroundColor": "#4200A8", "color": "white", "fontWeight": "bold", "fontSize": "15px", "cursor": "pointer"},
+                                        ),
+                                        html.Button(
+                                            "Clear", id="proximity-clear-btn", n_clicks=0,
+                                            style={"height": "48px", "padding": "0 18px", "border": "1px solid #D9CCFF", "borderRadius": "10px", "backgroundColor": "white", "color": "#2E1654", "fontWeight": "bold", "fontSize": "15px", "cursor": "pointer"},
+                                        ),
+                                    ],
+                                ),
+                                dcc.Loading(type="dot", color="#4200A8", children=html.Div(id="proximity-status", style={"marginTop": "12px", "minHeight": "20px"})),
+                                html.Small("Distances are straight-line. The address is only used to find its location and isn't saved.", style={"color": "#6F5A8C"}),
+                                dcc.Store(id="proximity-store", data=None),
+                            ],
+                        ),
+
                         html.Label("🔍 Search businesses", style={"fontWeight": "bold", "color": "#2E1654"}),
                         dcc.Input(
                             id="search-input", type="text", placeholder="Search by business name...", debounce=True,
@@ -1112,10 +1277,7 @@ dashboard_layout = html.Div(
                                     id="business-table",
                                     active_cell=None,
                                     hidden_columns=["_row_idx"],
-                                    columns=[
-                                        {"name": col, "id": col, "presentation": "markdown" if col == "Website" else "input", "editable": False}
-                                        for col in TABLE_COLS
-                                    ] + [{"name": "_row_idx", "id": "_row_idx", "editable": False}],
+                                    columns=table_columns(),
 
                                     page_current=0,
                                     page_size=10,
@@ -1446,6 +1608,7 @@ def apply_ai_filters(_clicks, _submit, text):
 # ── Server-Side Paginated Update Callbacks ────────────────────────────────────
 @app.callback(
     Output("business-table", "data"),
+    Output("business-table", "columns"),
     Output("business-table", "page_count"),
     Output("result-count", "children"),
     Output({"type": "msf-store", "index": "industry"}, "data"),
@@ -1468,8 +1631,9 @@ def apply_ai_filters(_clicks, _submit, text):
     Input("fav-update-trigger", "data"),
     Input("auth-session", "data"),
     Input("edit-save-trigger", "data"),
+    Input("proximity-store", "data"),
 )
-def update_table_server_side(page_current, page_size, sort_by, search, industry, category, council_area, suburb, accessibility, review_count, fav_only, _trig, _auth, _edit):
+def update_table_server_side(page_current, page_size, sort_by, search, industry, category, council_area, suburb, accessibility, review_count, fav_only, _trig, _auth, _edit, proximity):
     # Note: this callback intentionally does NOT listen to the msf-clear (✕)
     # buttons directly. Those buttons only clear the checklist's own "value"
     # (via msf_value_actions); this callback reacts to that value change
@@ -1484,21 +1648,35 @@ def update_table_server_side(page_current, page_size, sort_by, search, industry,
     masks = get_filter_masks(
         businesses, search=search, industry=industry, category=category,
         council_area=council_area, suburb=suburb, accessibility=accessibility,
-        review_count=review_count, favourites_only=fav_only
+        review_count=review_count, favourites_only=fav_only, proximity=proximity
     )
 
     combined_all = (
         masks["search"] & masks["industry"] & masks["category"] & 
         masks["council_area"] & masks["suburb"] & masks["accessibility"] & 
-        masks["review_count"] & masks["favourites"]
+        masks["review_count"] & masks["favourites"] & masks["proximity"]
     )
     filtered = businesses[combined_all]
 
-    if sort_by and len(sort_by) > 0:
-        col = sort_by[0]["column_id"]
+    has_origin = bool(proximity and proximity.get("lat") is not None)
+    distances = None
+    if has_origin:
+        distances = pd.Series(
+            distance_km_from(filtered, proximity["lat"], proximity["lon"]), index=filtered.index
+        )
+
+    sort_col = sort_by[0]["column_id"] if sort_by else None
+    if sort_col == DISTANCE_COL and distances is None:
+        sort_col = None
+
+    if sort_col:
         ascending = sort_by[0]["direction"] == "asc"
-        if col in filtered.columns:
-            filtered = filtered.sort_values(by=col, ascending=ascending)
+        if sort_col == DISTANCE_COL:
+            filtered = filtered.loc[distances.sort_values(ascending=ascending, kind="stable").index]
+        elif sort_col in filtered.columns:
+            filtered = filtered.sort_values(by=sort_col, ascending=ascending)
+    elif distances is not None:
+        filtered = filtered.loc[distances.sort_values(kind="stable").index]
     else:
         filtered = filtered.sort_values(by="_is_fav", ascending=False)
 
@@ -1509,15 +1687,17 @@ def update_table_server_side(page_current, page_size, sort_by, search, industry,
     end_idx = start_idx + page_size
     page_slice = filtered.iloc[start_idx:end_idx]
 
-    ind_mask = masks["search"] & masks["category"] & masks["council_area"] & masks["suburb"] & masks["accessibility"] & masks["review_count"] & masks["favourites"]
-    cat_mask = masks["search"] & masks["industry"] & masks["council_area"] & masks["suburb"] & masks["accessibility"] & masks["review_count"] & masks["favourites"]
-    cncl_mask = masks["search"] & masks["industry"] & masks["category"] & masks["suburb"] & masks["accessibility"] & masks["review_count"] & masks["favourites"]
-    sub_mask = masks["search"] & masks["industry"] & masks["category"] & masks["council_area"] & masks["accessibility"] & masks["review_count"] & masks["favourites"]
-    acc_mask = masks["search"] & masks["industry"] & masks["category"] & masks["council_area"] & masks["suburb"] & masks["review_count"] & masks["favourites"]
-    rev_mask = masks["search"] & masks["industry"] & masks["category"] & masks["council_area"] & masks["suburb"] & masks["accessibility"] & masks["favourites"]
+    ind_mask = masks["search"] & masks["category"] & masks["council_area"] & masks["suburb"] & masks["accessibility"] & masks["review_count"] & masks["favourites"] & masks["proximity"]
+    cat_mask = masks["search"] & masks["industry"] & masks["council_area"] & masks["suburb"] & masks["accessibility"] & masks["review_count"] & masks["favourites"] & masks["proximity"]
+    cncl_mask = masks["search"] & masks["industry"] & masks["category"] & masks["suburb"] & masks["accessibility"] & masks["review_count"] & masks["favourites"] & masks["proximity"]
+    sub_mask = masks["search"] & masks["industry"] & masks["category"] & masks["council_area"] & masks["accessibility"] & masks["review_count"] & masks["favourites"] & masks["proximity"]
+    acc_mask = masks["search"] & masks["industry"] & masks["category"] & masks["council_area"] & masks["suburb"] & masks["review_count"] & masks["favourites"] & masks["proximity"]
+    rev_mask = masks["search"] & masks["industry"] & masks["category"] & masks["council_area"] & masks["suburb"] & masks["accessibility"] & masks["favourites"] & masks["proximity"]
 
     display_data = page_slice[TABLE_COLS].copy()
     display_data["_row_idx"] = page_slice.index
+    if distances is not None:
+        display_data.insert(1, DISTANCE_COL, distances.loc[page_slice.index].round(1))
 
     display_data["Website"] = display_data["Website"].apply(
         lambda link: f"[🌐 Website]({link})" if str(link).strip() else ""
@@ -1527,10 +1707,16 @@ def update_table_server_side(page_current, page_size, sort_by, search, industry,
     for rec in records:
         rec["id"] = rec["_row_idx"]
 
+    if has_origin:
+        count_text = f"{total_rows} businesses found within {proximity.get('radius')} km of {proximity.get('label')}"
+    else:
+        count_text = f"{total_rows} businesses found"
+
     return (
         records,
+        table_columns(with_distance=has_origin),
         page_count,
-        f"{total_rows} businesses found",
+        count_text,
         make_options(businesses.loc[ind_mask, "Industry"].unique()),
         make_options(businesses.loc[cat_mask, "Category"].unique()),
         make_options(businesses.loc[cncl_mask, "Council Area"].unique()),
@@ -1538,6 +1724,52 @@ def update_table_server_side(page_current, page_size, sort_by, search, industry,
         compute_accessibility_options(businesses[acc_mask]),
         compute_review_count_options(businesses[rev_mask]),
     )
+
+
+@app.callback(
+    Output("proximity-store", "data"),
+    Output("proximity-status", "children"),
+    Output("proximity-address", "value"),
+    Output("business-table", "page_current", allow_duplicate=True),
+    Input("proximity-submit-btn", "n_clicks"),
+    Input("proximity-address", "n_submit"),
+    Input("proximity-clear-btn", "n_clicks"),
+    Input("proximity-radius", "value"),
+    State("proximity-address", "value"),
+    State("proximity-store", "data"),
+    prevent_initial_call=True,
+)
+def set_proximity(_submit_clicks, _n_submit, _clear_clicks, radius, address, current):
+    trig = ctx.triggered_id
+    radius = radius or PROXIMITY_DEFAULT_RADIUS
+
+    if trig == "proximity-clear-btn":
+        return None, "", "", 0
+
+    address = (address or "").strip()
+    has_current = bool(current and current.get("lat") is not None)
+
+    if trig == "proximity-radius":
+        if not has_current:
+            raise PreventUpdate
+        if not address or address == current.get("query"):
+            updated = {**current, "radius": radius}
+            return updated, _proximity_status(updated), no_update, 0
+
+    if not address:
+        return no_update, _ai_notice("Type an address or suburb first.", "error"), no_update, no_update
+
+    found = geocode_address(address)
+    if not found:
+        return None, _ai_notice("Couldn't find that address. Try adding the suburb, e.g. '… , Clayton'.", "error"), no_update, 0
+
+    found = {**found, "radius": radius, "query": address}
+    return found, _proximity_status(found), no_update, 0
+
+
+def _proximity_status(loc):
+    note = " (approximate, based on the suburb)" if loc.get("approximate") else ""
+    return _ai_notice(f"Showing businesses within {loc['radius']} km of {loc['label']}{note}, closest first.")
 
 
 # ── Map View ──────────────────────────────────────────────────────────────────
@@ -1581,9 +1813,10 @@ def toggle_view_mode(_table_clicks, _map_clicks):
     Input("fav-update-trigger", "data"),
     Input("edit-save-trigger", "data"),
     Input("business-map", "relayoutData"),
+    Input("proximity-store", "data"),
     State("map-zoom-store", "data"),
 )
-def update_map_figure(search, industry, category, council_area, suburb, accessibility, review_count, fav_only, _trig, _edit, relayout, last_zoom):
+def update_map_figure(search, industry, category, council_area, suburb, accessibility, review_count, fav_only, _trig, _edit, relayout, proximity, last_zoom):
     # Panning never needs a rebuild (clusters only depend on zoom), so the map moves freely.
     # Only rebuild when the zoom level actually changed, or when a filter triggered this.
     zoom = last_zoom
@@ -1601,6 +1834,11 @@ def update_map_figure(search, industry, category, council_area, suburb, accessib
         if zoom is None or (last_zoom is not None and abs(zoom - float(last_zoom)) < 0.01):
             raise PreventUpdate
 
+    origin = proximity if proximity and proximity.get("lat") is not None else None
+    if ctx.triggered_id == "proximity-store" and origin:
+        view_center = {"lat": float(origin["lat"]), "lon": float(origin["lon"])}
+        zoom = PROXIMITY_ZOOM.get(int(origin.get("radius") or PROXIMITY_DEFAULT_RADIUS), 11)
+
     if not industry:
         category = []
     if not council_area:
@@ -1609,15 +1847,15 @@ def update_map_figure(search, industry, category, council_area, suburb, accessib
     masks = get_filter_masks(
         businesses, search=search, industry=industry, category=category,
         council_area=council_area, suburb=suburb, accessibility=accessibility,
-        review_count=review_count, favourites_only=fav_only
+        review_count=review_count, favourites_only=fav_only, proximity=proximity
     )
     combined_all = (
         masks["search"] & masks["industry"] & masks["category"] &
         masks["council_area"] & masks["suburb"] & masks["accessibility"] &
-        masks["review_count"] & masks["favourites"]
+        masks["review_count"] & masks["favourites"] & masks["proximity"]
     )
     map_df = businesses[combined_all]
-    return _build_map_figure(map_df, center=view_center, zoom=zoom), zoom
+    return _build_map_figure(map_df, center=view_center, zoom=zoom, origin=origin), zoom
 
 
 # One-time (per graph node) clientside binding of hover/unhover so a dot enlarges
