@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 import base64
+import math
 import os
 import secrets
 import threading
@@ -885,87 +886,188 @@ MAP_MARKER_FAV_COLOR = "#FF8C00"   # Keystone orange, for favourited businesses
 DEFAULT_MAP_CENTER = {"lat": -37.8136, "lon": 144.9631}  # Melbourne CBD fallback
 
 
-MAP_CLUSTER_MIN = 100          # Only areas with this many businesses (or more) become a cluster bubble
-MAP_CLUSTER_CELL_PX = 80       # Size of the grouping cell, in screen pixels, at the current zoom
-MAP_CLUSTER_COLOR = "#66F2E3"  # Keystone light blue
+# ── Map search behaviour (Airbnb-style "search as I move the map") ─────────────
+# Instead of sending every business to the browser and clustering them, the map only
+# ever receives the (at most) MAP_MAX_BUSINESSES best matches inside the current view.
+# Panning/zooming triggers a fresh, tiny search; zooming in reveals more businesses.
+MAP_MAX_BUSINESSES = 50
 MAP_DEFAULT_ZOOM = 10.5
+MAP_GRID_COLS = 7                   # The view is split into COLS x ROWS cells and the best
+MAP_GRID_ROWS = 5                   # business of each cell is picked first, so dots spread out.
+MAP_ASSUMED_VIEW_PX = (1100, 620)   # Only used to estimate the view before the browser reports it.
+
+MAP_BTN_STYLE_HIDDEN = {"display": "none"}
+MAP_BTN_STYLE_SHOWN = {
+    "background": "#4200A8", "color": "white", "border": "none", "padding": "9px 18px",
+    "borderRadius": "999px", "fontWeight": "bold", "cursor": "pointer", "fontSize": "14px",
+    "boxShadow": "0 2px 10px rgba(46,22,84,0.30)",
+}
+MAP_PILL_STYLE = {
+    "background": "white", "borderRadius": "999px", "padding": "8px 16px", "fontSize": "14px",
+    "fontWeight": "600", "color": "#2E1654", "boxShadow": "0 2px 10px rgba(46,22,84,0.25)",
+}
+
+# Plain numpy copies of the columns the map needs: a viewport lookup is then a few
+# vectorised comparisons (milliseconds even for 100k+ rows) rather than DataFrame work.
+# Kept out of the DataFrame so they are never written back to the CSV.
+_MAP_LAT = businesses["Latitude"].to_numpy(dtype=float)
+_MAP_LON = businesses["Longitude"].to_numpy(dtype=float)
+_MAP_VALID = np.isfinite(_MAP_LAT) & np.isfinite(_MAP_LON)
+# Ranking used to decide which businesses win a spot: rating, boosted by how many reviews back it up.
+_MAP_RANK = (
+    businesses["Total Score"].fillna(0).to_numpy(dtype=float)
+    * np.log1p(businesses["Reviews Count"].fillna(0).to_numpy(dtype=float))
+)
+
+# Bumped whenever favourites / business details change so cached filter masks are discarded.
+_DATA_VERSION = 0
 
 
-def _cluster_cells(lat, lon, zoom):
-    """Assign each point to a square screen-pixel cell at the given zoom (Web Mercator)."""
-    scale = 256 * (2 ** zoom)
-    x = (lon.to_numpy(dtype=float) + 180.0) / 360.0 * scale
-    lat_rad = np.radians(np.clip(lat.to_numpy(dtype=float), -85.0, 85.0))
-    y = (1.0 - np.log(np.tan(lat_rad) + 1.0 / np.cos(lat_rad)) / np.pi) / 2.0 * scale
-    cx = np.floor(x / MAP_CLUSTER_CELL_PX).astype(np.int64)
-    cy = np.floor(y / MAP_CLUSTER_CELL_PX).astype(np.int64)
-    return cx * 1_000_003 + cy
+def bump_data_version():
+    global _DATA_VERSION
+    _DATA_VERSION += 1
 
 
-def _build_map_figure(map_df, center=None, zoom=None, origin=None):
-    """Scattermapbox figure: a light-blue bubble only where 100+ businesses sit in the same
-    screen area; everywhere else, individual purple (or orange if favourited) dots."""
-    lat = pd.to_numeric(map_df["Latitude"], errors="coerce")
-    lon = pd.to_numeric(map_df["Longitude"], errors="coerce")
-    valid = lat.notna() & lon.notna()
-    map_df = map_df.loc[valid]
-    lat = lat.loc[valid]
-    lon = lon.loc[valid]
+@lru_cache(maxsize=32)
+def _cached_map_mask(search, industry, category, council_area, suburb, accessibility,
+                     review_count, fav_only, prox_key, version):
+    """Filter mask for the current sidebar filters. Cached so that panning the map (which
+    doesn't change any filter) skips the expensive text search / isin work entirely."""
+    proximity = None
+    if prox_key is not None:
+        proximity = {"lat": prox_key[0], "lon": prox_key[1], "radius": prox_key[2]}
+    masks = get_filter_masks(
+        businesses, search=search, industry=industry, category=category,
+        council_area=council_area, suburb=suburb, accessibility=accessibility,
+        review_count=review_count, favourites_only=fav_only, proximity=proximity,
+    )
+    combined = np.ones(len(businesses), dtype=bool)
+    for m in masks.values():
+        combined &= np.asarray(m, dtype=bool)
+    return combined
 
-    # Default center/zoom if the user hasn't panned or zoomed yet
-    if center is None:
-        if origin and origin.get("lat") is not None:
-            center = {"lat": float(origin["lat"]), "lon": float(origin["lon"])}
-        elif len(map_df) > 0:
-            center = {"lat": float(lat.mean()), "lon": float(lon.mean())}
-        else:
-            center = DEFAULT_MAP_CENTER
 
-    if zoom is None:
-        zoom = MAP_DEFAULT_ZOOM if len(map_df) else 9
+def _bounds_from_view(center, zoom, width_px=None, height_px=None):
+    """Estimate [south, north, west, east] from a centre + zoom (Web Mercator, 512px world tile).
+    Only a fallback: once the user moves the map, the browser reports the exact corners."""
+    width_px = width_px or MAP_ASSUMED_VIEW_PX[0]
+    height_px = height_px or MAP_ASSUMED_VIEW_PX[1]
+    world_px = 512.0 * (2.0 ** float(zoom))
+    lat = max(min(float(center["lat"]), 85.0), -85.0)
+    s = math.sin(math.radians(lat))
+    cx = (float(center["lon"]) + 180.0) / 360.0
+    cy = 0.5 - math.log((1 + s) / (1 - s)) / (4 * math.pi)
+    half_w = width_px / 2.0 / world_px
+    half_h = height_px / 2.0 / world_px
 
+    def y_to_lat(y):
+        return math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y))))
+
+    return [
+        y_to_lat(cy + half_h), y_to_lat(cy - half_h),
+        (cx - half_w) * 360.0 - 180.0, (cx + half_w) * 360.0 - 180.0,
+    ]
+
+
+def _make_view(center, zoom):
+    return {"center": center, "zoom": float(zoom), "bounds": _bounds_from_view(center, zoom)}
+
+
+def _default_map_view(mask=None, origin=None):
+    if origin and origin.get("lat") is not None:
+        center = {"lat": float(origin["lat"]), "lon": float(origin["lon"])}
+        zoom = PROXIMITY_ZOOM.get(int(origin.get("radius") or PROXIMITY_DEFAULT_RADIUS), 11)
+        return _make_view(center, zoom)
+    sel = _MAP_VALID if mask is None else (mask & _MAP_VALID)
+    if sel.any():
+        center = {"lat": float(_MAP_LAT[sel].mean()), "lon": float(_MAP_LON[sel].mean())}
+    else:
+        center = DEFAULT_MAP_CENTER
+    return _make_view(center, MAP_DEFAULT_ZOOM)
+
+
+def _view_from_relayout(relayout, last_view):
+    """Turn Plotly's relayoutData into {"center", "zoom", "bounds"}; None if it wasn't a camera move."""
+    if not isinstance(relayout, dict):
+        return None
+    center = None
+    c = relayout.get("mapbox.center")
+    if isinstance(c, dict) and "lat" in c and "lon" in c:
+        center = {"lat": float(c["lat"]), "lon": float(c["lon"])}
+    elif "mapbox.center.lat" in relayout and "mapbox.center.lon" in relayout:
+        center = {"lat": float(relayout["mapbox.center.lat"]), "lon": float(relayout["mapbox.center.lon"])}
+    zoom = relayout.get("mapbox.zoom")
+    derived = relayout.get("mapbox._derived")
+    corners = derived.get("coordinates") if isinstance(derived, dict) else None
+    if center is None and zoom is None and not corners:
+        return None  # e.g. "autosize": not a pan/zoom
+
+    prev = last_view or {}
+    center = center or prev.get("center") or DEFAULT_MAP_CENTER
+    zoom = float(zoom) if zoom is not None else float(prev.get("zoom") or MAP_DEFAULT_ZOOM)
+    if corners:  # exact visible corners reported by the browser: [[lon, lat], ...]
+        lons = [float(p[0]) for p in corners]
+        lats = [float(p[1]) for p in corners]
+        bounds = [min(lats), max(lats), min(lons), max(lons)]
+    else:
+        bounds = _bounds_from_view(center, zoom)
+    return {"center": center, "zoom": zoom, "bounds": bounds}
+
+
+def _pick_map_businesses(mask, bounds, limit=MAP_MAX_BUSINESSES):
+    """Return (row positions to draw, total matches in view).
+
+    Matches inside the view are ranked best-first, then picked round-robin across a coarse
+    grid so the dots spread over the whole view instead of piling up in the busiest
+    spot. Favourites always get priority. At most `limit` rows are returned."""
+    south, north, west, east = bounds
+    in_view = (
+        mask & _MAP_VALID
+        & (_MAP_LAT >= south) & (_MAP_LAT <= north)
+        & (_MAP_LON >= west) & (_MAP_LON <= east)
+    )
+    pos = np.flatnonzero(in_view)
+    total = int(pos.size)
+    if total <= limit:
+        return pos, total
+
+    pos = pos[np.argsort(-_MAP_RANK[pos], kind="stable")]          # best first
+    gx = np.clip(((_MAP_LON[pos] - west) / max(east - west, 1e-9) * MAP_GRID_COLS).astype(int), 0, MAP_GRID_COLS - 1)
+    gy = np.clip(((north - _MAP_LAT[pos]) / max(north - south, 1e-9) * MAP_GRID_ROWS).astype(int), 0, MAP_GRID_ROWS - 1)
+    cell = gy * MAP_GRID_COLS + gx
+    rank_in_cell = pd.Series(cell).groupby(cell).cumcount().to_numpy()   # 0 = best in its cell
+    not_fav = ~businesses["_is_fav"].to_numpy(dtype=bool)[pos]
+    keep = np.lexsort((np.arange(pos.size), rank_in_cell, not_fav))[:limit]
+    return pos[keep], total
+
+
+def _map_status_text(shown, total):
+    if total == 0:
+        return "No matching businesses here. Zoom out or move the map"
+    if total <= shown:
+        return f"{total} business{'es' if total != 1 else ''} in this area"
+    return f"Showing {shown} of {total:,} in this area. Zoom in to see more"
+
+
+def _build_map_figure(map_df, view, origin=None):
+    """Scattermapbox figure of (at most MAP_MAX_BUSINESSES) individual dots: purple, or orange if favourited."""
+    center, zoom = view["center"], view["zoom"]
     fig = go.Figure()
 
     if len(map_df) > 0:
-        cell = pd.Series(_cluster_cells(lat, lon, float(zoom)), index=map_df.index)
-        cell_size = cell.map(cell.value_counts())
-        in_cluster = cell_size >= MAP_CLUSTER_MIN
-
-        # Individual dots (every business NOT in a 100+ area)
-        dots = map_df.loc[~in_cluster]
-        is_fav = dots.get("_is_fav", pd.Series(False, index=dots.index))
         fig.add_trace(go.Scattermapbox(
-            lat=lat.loc[dots.index],
-            lon=lon.loc[dots.index],
+            lat=map_df["Latitude"],
+            lon=map_df["Longitude"],
             mode="markers",
             marker=dict(
                 size=MAP_MARKER_BASE_SIZE,
-                color=[MAP_MARKER_FAV_COLOR if f else MAP_MARKER_COLOR for f in is_fav],
+                color=[MAP_MARKER_FAV_COLOR if f else MAP_MARKER_COLOR for f in map_df["_is_fav"]],
                 opacity=0.9,
             ),
-            text=dots["Business Name"],
-            customdata=dots.index.to_list(),
+            text=map_df["Business Name"],
+            customdata=map_df.index.to_list(),
             hovertemplate="%{text}<extra></extra>",
         ))
-
-        # Cluster bubbles (only cells with 100+ businesses)
-        if in_cluster.any():
-            grp = pd.DataFrame({
-                "lat": lat.loc[in_cluster], "lon": lon.loc[in_cluster], "cell": cell.loc[in_cluster],
-            }).groupby("cell").agg(lat=("lat", "mean"), lon=("lon", "mean"), n=("lat", "size"))
-            fig.add_trace(go.Scattermapbox(
-                lat=grp["lat"],
-                lon=grp["lon"],
-                mode="markers+text",
-                marker=dict(
-                    size=(32 + 8 * np.log10(grp["n"] / MAP_CLUSTER_MIN)).clip(upper=56),
-                    color=MAP_CLUSTER_COLOR,
-                    opacity=0.95,
-                ),
-                text=grp["n"].astype(str),
-                textfont=dict(size=12, color="#1A0A3D"),
-                hoverinfo="skip",
-            ))
 
     if origin and origin.get("lat") is not None:
         radius = float(origin.get("radius") or PROXIMITY_DEFAULT_RADIUS)
@@ -996,10 +1098,16 @@ def _build_map_figure(map_df, center=None, zoom=None, origin=None):
         ),
         margin=dict(l=0, r=0, t=0, b=0),
         showlegend=False,
-        uirevision=f"keystone-map-{origin['lat']}-{origin['lon']}-{origin.get('radius')}" if origin else "keystone-map",       # Preserves UI view state between updates
+        uirevision=f"keystone-map-{origin['lat']}-{origin['lon']}-{origin.get('radius')}" if origin else "keystone-map",       # Preserves the user's pan/zoom between updates
         paper_bgcolor="#F8F5FF",
     )
     return fig
+
+
+# First paint: the default view, capped like every later search.
+_initial_view = _default_map_view()
+_initial_pos, _ = _pick_map_businesses(np.ones(len(businesses), dtype=bool), _initial_view["bounds"])
+_initial_map_fig = _build_map_figure(businesses.iloc[_initial_pos], _initial_view)
 
 app = Dash(__name__, suppress_callback_exceptions=True)
 app.title = "Keystone Employer Database"
@@ -1305,16 +1413,46 @@ dashboard_layout = html.Div(
                         html.Div(
                             id="map-view-container", style={"display": "none"},
                             children=[
-                                dcc.Graph(
-                                    id="business-map",
-                                    figure=_build_map_figure(businesses),
-                                    config={"scrollZoom": True, "displayModeBar": False, "doubleClick": "reset"},
-                                    style={"height": "620px", "borderRadius": "16px", "overflow": "hidden"},
+                                html.Div(
+                                    style={"position": "relative", "borderRadius": "16px", "overflow": "hidden"},
+                                    children=[
+                                        dcc.Graph(
+                                            id="business-map",
+                                            figure=_initial_map_fig,
+                                            config={"scrollZoom": True, "displayModeBar": False, "doubleClick": "reset"},
+                                            style={"height": "620px"},
+                                        ),
+                                        # Top-centre: auto re-search toggle + manual "Search this area"
+                                        html.Div(
+                                            style={"position": "absolute", "top": "14px", "left": "50%", "transform": "translateX(-50%)",
+                                                   "zIndex": 5, "display": "flex", "gap": "8px", "alignItems": "center"},
+                                            children=[
+                                                html.Div(
+                                                    dcc.Checklist(
+                                                        id="map-auto-search",
+                                                        options=[{"label": " Search as I move the map", "value": "on"}],
+                                                        value=["on"],
+                                                        inputStyle={"marginRight": "6px", "accentColor": "#4200A8"},
+                                                        style={"margin": 0},
+                                                    ),
+                                                    style=MAP_PILL_STYLE,
+                                                ),
+                                                html.Button("Search this area", id="map-search-area-btn", n_clicks=0, style=MAP_BTN_STYLE_HIDDEN),
+                                            ],
+                                        ),
+                                        # Bottom-centre: how many are showing
+                                        html.Div(
+                                            id="map-status",
+                                            children=_map_status_text(len(_initial_pos), _initial_pos.size),
+                                            style={**MAP_PILL_STYLE, "position": "absolute", "bottom": "16px", "left": "50%",
+                                                   "transform": "translateX(-50%)", "zIndex": 5, "whiteSpace": "nowrap"},
+                                        ),
+                                    ],
                                 ),
                             ],
                         ),
                         dcc.Store(id="view-mode-store", data="table"),
-                        dcc.Store(id="map-zoom-store", data=None)
+                        dcc.Store(id="map-view-store", data=None)
                     ],
                 ),
             ],
@@ -1801,7 +1939,9 @@ def toggle_view_mode(_table_clicks, _map_clicks):
 
 @app.callback(
     Output("business-map", "figure"),
-    Output("map-zoom-store", "data"),
+    Output("map-view-store", "data"),
+    Output("map-status", "children"),
+    Output("map-search-area-btn", "style"),
     Input("search-input", "value"),
     Input({"type": "msf-checklist", "index": "industry"}, "value"),
     Input({"type": "msf-checklist", "index": "category"}, "value"),
@@ -1814,48 +1954,54 @@ def toggle_view_mode(_table_clicks, _map_clicks):
     Input("edit-save-trigger", "data"),
     Input("business-map", "relayoutData"),
     Input("proximity-store", "data"),
-    State("map-zoom-store", "data"),
+    Input("map-auto-search", "value"),
+    Input("map-search-area-btn", "n_clicks"),
+    State("map-view-store", "data"),
 )
-def update_map_figure(search, industry, category, council_area, suburb, accessibility, review_count, fav_only, _trig, _edit, relayout, proximity, last_zoom):
-    # Panning never needs a rebuild (clusters only depend on zoom), so the map moves freely.
-    # Only rebuild when the zoom level actually changed, or when a filter triggered this.
-    zoom = last_zoom
-    if isinstance(relayout, dict) and relayout.get("mapbox.zoom") is not None:
-        zoom = float(relayout["mapbox.zoom"])
-    # Keep the rebuilt figure at the position the user panned to (don't snap back to the data centre)
-    view_center = None
-    if isinstance(relayout, dict):
-        c = relayout.get("mapbox.center")
-        if isinstance(c, dict) and "lat" in c and "lon" in c:
-            view_center = {"lat": float(c["lat"]), "lon": float(c["lon"])}
-        elif "mapbox.center.lat" in relayout and "mapbox.center.lon" in relayout:
-            view_center = {"lat": float(relayout["mapbox.center.lat"]), "lon": float(relayout["mapbox.center.lon"])}
-    if ctx.triggered_id == "business-map":
-        if zoom is None or (last_zoom is not None and abs(zoom - float(last_zoom)) < 0.01):
-            raise PreventUpdate
-
+def update_map_figure(search, industry, category, council_area, suburb, accessibility, review_count,
+                      fav_only, _trig, _edit, relayout, proximity, auto_value, _search_clicks, last_view):
+    """Airbnb-style map search: every time the view or a filter changes, re-query the businesses
+    inside the visible area and draw only the best MAP_MAX_BUSINESSES of them."""
+    trig = ctx.triggered_id
+    auto = bool(auto_value)
+    btn_style = MAP_BTN_STYLE_HIDDEN if auto else MAP_BTN_STYLE_SHOWN
     origin = proximity if proximity and proximity.get("lat") is not None else None
-    if ctx.triggered_id == "proximity-store" and origin:
-        view_center = {"lat": float(origin["lat"]), "lon": float(origin["lon"])}
-        zoom = PROXIMITY_ZOOM.get(int(origin.get("radius") or PROXIMITY_DEFAULT_RADIUS), 11)
 
+    # ── 1. Where is the map looking? ──
+    view = last_view
+    if trig == "business-map":
+        view = _view_from_relayout(relayout, last_view)
+        if view is None:
+            raise PreventUpdate
+        if not auto:
+            # Remember the new view for the "Search this area" button, but leave the dots alone.
+            return no_update, view, no_update, btn_style
+    elif trig == "map-auto-search" and not auto:
+        return no_update, no_update, no_update, btn_style
+
+    # ── 2. Which businesses match the sidebar filters? (cached: panning reuses it) ──
     if not industry:
         category = []
     if not council_area:
         suburb = []
+    prox_key = (
+        (float(origin["lat"]), float(origin["lon"]), float(origin.get("radius") or PROXIMITY_DEFAULT_RADIUS))
+        if origin else None
+    )
+    mask = _cached_map_mask(
+        (search or "").strip(), tuple(industry or ()), tuple(category or ()), tuple(council_area or ()),
+        tuple(suburb or ()), tuple(accessibility or ()), tuple(review_count or ()),
+        bool(fav_only), prox_key, _DATA_VERSION,
+    )
 
-    masks = get_filter_masks(
-        businesses, search=search, industry=industry, category=category,
-        council_area=council_area, suburb=suburb, accessibility=accessibility,
-        review_count=review_count, favourites_only=fav_only, proximity=proximity
-    )
-    combined_all = (
-        masks["search"] & masks["industry"] & masks["category"] &
-        masks["council_area"] & masks["suburb"] & masks["accessibility"] &
-        masks["review_count"] & masks["favourites"] & masks["proximity"]
-    )
-    map_df = businesses[combined_all]
-    return _build_map_figure(map_df, center=view_center, zoom=zoom, origin=origin), zoom
+    # Jump to a new address, or fall back to the default view on first load
+    if view is None or (trig == "proximity-store" and origin):
+        view = _default_map_view(mask, origin)
+
+    # ── 3. Pick the (at most 50) businesses to show inside that view ──
+    pos, total = _pick_map_businesses(mask, view["bounds"])
+    fig = _build_map_figure(businesses.iloc[pos], view, origin=origin)
+    return fig, view, _map_status_text(len(pos), total), btn_style
 
 
 # One-time (per graph node) clientside binding of hover/unhover so a dot enlarges
@@ -2232,6 +2378,7 @@ def save_business_details(save_clicks, industry_val, category_val, phone_val, em
     businesses.loc[current_idx, "Category"] = str(category_val or "").strip()
     businesses.loc[current_idx, "Phone"] = str(phone_val or "").strip()
     businesses.loc[current_idx, "Email"] = str(email_val or "").strip()
+    bump_data_version()
 
     threading.Thread(target=_async_save_csv, args=(businesses.copy(),), daemon=True).start()
 
@@ -2263,6 +2410,7 @@ def toggle_favourite(n_clicks, current_idx):
         fav_set.discard(biz_name)
         
     save_favourites(fav_set)
+    bump_data_version()
     return n_clicks
 
 
@@ -2316,3 +2464,4 @@ def manage_comments(add_clicks, delete_clicks_list, current_idx, text):
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=8055, debug=False)
+    
