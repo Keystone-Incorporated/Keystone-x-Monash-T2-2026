@@ -14,6 +14,7 @@ import urllib.request
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+from sqlalchemy import create_engine, text
 
 from dash import Dash, Input, Output, State, dash_table, dcc, html, ctx, ALL, MATCH
 from dash.exceptions import PreventUpdate
@@ -44,6 +45,20 @@ def load_local_env():
 load_local_env()
 ACCESS_PASSWORD = os.getenv("DASH_ACCESS_PASSWORD")
 SESSION_SECRET = os.getenv("DASH_SESSION_SECRET") or secrets.token_urlsafe(32)
+DATA_SOURCE = os.getenv("DATA_SOURCE", "csv").strip().lower()
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if DATA_SOURCE not in {"csv", "supabase"}:
+    raise ValueError("DATA_SOURCE must be either 'csv' or 'supabase'.")
+
+if DATA_SOURCE == "supabase" and not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is required when DATA_SOURCE=supabase.")
+
+engine = (
+    create_engine(DATABASE_URL, pool_pre_ping=True)
+    if DATA_SOURCE == "supabase"
+    else None
+)
 
 if not ACCESS_PASSWORD:
     raise RuntimeError(
@@ -63,6 +78,14 @@ _CSV_LOCK = threading.Lock()
 
 def load_favourites():
     global _FAV_SET
+    if DATA_SOURCE == "supabase":
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT business_name FROM public.favourites")
+            ).scalars().all()
+        _FAV_SET = set(rows)
+        return _FAV_SET
+
     if FAVOURITES_FILE.exists():
         try:
             with open(FAVOURITES_FILE, "r", encoding="utf-8") as f:
@@ -81,10 +104,50 @@ def _async_save_favourites(favs_list):
 def save_favourites(favs):
     global _FAV_SET
     _FAV_SET = set(favs)
-    threading.Thread(target=_async_save_favourites, args=(sorted(list(_FAV_SET)),), daemon=True).start()
+    if DATA_SOURCE == "csv":
+        threading.Thread(target=_async_save_favourites, args=(sorted(list(_FAV_SET)),), daemon=True).start()
+
+def persist_favourite_change(business_name, is_favourite):
+    if DATA_SOURCE == "csv":
+        save_favourites(_FAV_SET)
+        return
+
+    with engine.begin() as conn:
+        if is_favourite:
+            conn.execute(
+                text("""
+                    INSERT INTO public.favourites (business_name)
+                    VALUES (:business_name)
+                    ON CONFLICT (business_name) DO NOTHING
+                """),
+                {"business_name": business_name},
+            )
+        else:
+            conn.execute(
+                text("DELETE FROM public.favourites WHERE business_name = :business_name"),
+                {"business_name": business_name},
+            )
 
 @lru_cache(maxsize=1)
 def load_comments():
+    if DATA_SOURCE == "supabase":
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT id, business_name, comment_text, created_at
+                    FROM public.comments
+                    ORDER BY created_at ASC, id ASC
+                """)
+            ).mappings().all()
+        comments = {}
+        for row in rows:
+            comments.setdefault(row["business_name"], []).append({
+                "id": row["id"],
+                "time": row["created_at"].isoformat(),
+                "text": row["comment_text"],
+            })
+        return comments
+
     if COMMENTS_FILE.exists():
         try:
             with open(COMMENTS_FILE, "r", encoding="utf-8") as f:
@@ -101,11 +164,84 @@ def save_comments(comments):
     threading.Thread(target=_async_save_comments, args=(comments,), daemon=True).start()
     load_comments.cache_clear()
 
+def get_comments(business_name):
+    if DATA_SOURCE == "csv":
+        return load_comments().get(business_name, [])
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT id, comment_text, created_at
+                FROM public.comments
+                WHERE business_name = :business_name
+                ORDER BY created_at ASC, id ASC
+            """),
+            {"business_name": business_name},
+        ).mappings().all()
+
+    return [
+        {"id": row["id"], "time": row["created_at"].isoformat(), "text": row["comment_text"]}
+        for row in rows
+    ]
+
+def add_comment(business_name, comment_text):
+    if DATA_SOURCE == "csv":
+        comments = load_comments()
+        comments.setdefault(business_name, []).append({
+            "time": datetime.now().isoformat(),
+            "text": comment_text,
+        })
+        save_comments(comments)
+        return
+
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO public.comments (business_name, comment_text)
+                VALUES (:business_name, :comment_text)
+            """),
+            {"business_name": business_name, "comment_text": comment_text},
+        )
+    load_comments.cache_clear()
+
+def delete_comment(business_name, comment_id):
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                DELETE FROM public.comments
+                WHERE id = :comment_id AND business_name = :business_name
+            """),
+            {"comment_id": int(comment_id), "business_name": business_name},
+        )
+    load_comments.cache_clear()
+
 def _async_save_csv(df_copy):
     with _CSV_LOCK:
         df_copy.drop(columns=["_search_name", "_is_fav"], errors="ignore").to_csv(
             DATA_FILE, index=False, encoding="utf-8-sig"
         )
+
+def update_business_details(business_id, industry, category, phone, email):
+    with engine.begin() as conn:
+        result = conn.execute(
+            text("""
+                UPDATE public.businesses
+                SET "Industry" = :industry,
+                    "Category" = :category,
+                    "Phone" = :phone,
+                    "Email" = :email
+                WHERE id = :business_id
+            """),
+            {
+                "industry": industry,
+                "category": category,
+                "phone": phone,
+                "email": email,
+                "business_id": int(business_id),
+            },
+        )
+        if result.rowcount != 1:
+            raise RuntimeError(f"Expected to update one business row, found {result.rowcount}.")
 
 # ── Logo helper ──────────────────────────────────────────────────────────────
 def encode_logo(path):
@@ -118,12 +254,28 @@ def encode_logo(path):
 logo_src = encode_logo(LOGO_FILE)
 
 # ── Load CSV & Data Processing ───────────────────────────────────────────────
-businesses = pd.read_csv(DATA_FILE, encoding="utf-8-sig")
+if DATA_SOURCE == "supabase":
+    with engine.connect() as conn:
+        businesses = pd.read_sql(
+            text('SELECT * FROM public.businesses ORDER BY id'), conn
+        )
+    if "id" not in businesses.columns:
+        raise ValueError("public.businesses must include its generated id column.")
+    businesses["_database_id"] = businesses.pop("id")
+else:
+    businesses = pd.read_csv(DATA_FILE, encoding="utf-8-sig")
+
 businesses.columns = businesses.columns.str.strip()
 businesses = businesses.replace({"(blank)": "", "blank": ""}).fillna("")
 
 # Exclude permanently closed businesses
 businesses = businesses[businesses["Permanently Closed"].astype(str).str.lower() != "true"].reset_index(drop=True)
+
+DB_BUSINESS_IDS = (
+    businesses.pop("_database_id").astype(int).to_dict()
+    if DATA_SOURCE == "supabase"
+    else {}
+)
 
 for col in ["Reviews Count", "Total Score", "Latitude", "Longitude"]:
     if col in businesses.columns:
@@ -2044,17 +2196,17 @@ def _category_card(title, icon, fields, header_right=None):
 def _build_modal_content(row_idx, row, edit_mode=False, show_back=False):
     business_name = row.get("Business Name", "")
     is_fav = bool(row.get("_is_fav", False))
-    comments_dict = load_comments()
-    comments = comments_dict.get(business_name, [])
+    comments = get_comments(business_name)
 
     if comments:
         comments_children = []
         for i, c in enumerate(comments):
+            comment_key = c.get("id") if DATA_SOURCE == "supabase" else i
             comments_children.append(
                 html.Div([
                     html.Div([
                         html.Small(datetime.fromisoformat(c["time"]).strftime("%d %b %Y %H:%M"), style={"color": "#888", "fontSize": "12px"}),
-                        html.Button("🗑️", id={"type": "delete-comment-btn", "index": i}, n_clicks=0, title="Delete comment", style={"background": "none", "border": "none", "cursor": "pointer", "fontSize": "16px", "padding": "0 4px"}),
+                        html.Button("🗑️", id={"type": "delete-comment-btn", "index": comment_key}, n_clicks=0, title="Delete comment", style={"background": "none", "border": "none", "cursor": "pointer", "fontSize": "16px", "padding": "0 4px"}),
                     ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center"}),
                     html.P(c["text"], style={"marginTop": "4px", "color": "#333", "whiteSpace": "pre-wrap"})
                 ], style={"background": "#F8F5FF", "padding": "12px", "borderRadius": "8px", "marginBottom": "8px"})
@@ -2374,13 +2526,27 @@ def save_business_details(save_clicks, industry_val, category_val, phone_val, em
     if not save_clicks or current_idx is None or current_idx not in businesses.index:
         raise PreventUpdate
 
-    businesses.loc[current_idx, "Industry"] = str(industry_val or "").strip()
-    businesses.loc[current_idx, "Category"] = str(category_val or "").strip()
-    businesses.loc[current_idx, "Phone"] = str(phone_val or "").strip()
-    businesses.loc[current_idx, "Email"] = str(email_val or "").strip()
+    updated = {
+        "Industry": str(industry_val or "").strip(),
+        "Category": str(category_val or "").strip(),
+        "Phone": str(phone_val or "").strip(),
+        "Email": str(email_val or "").strip(),
+    }
+    if DATA_SOURCE == "supabase":
+        update_business_details(
+            DB_BUSINESS_IDS[current_idx],
+            updated["Industry"],
+            updated["Category"],
+            updated["Phone"],
+            updated["Email"],
+        )
+
+    for column, value in updated.items():
+        businesses.loc[current_idx, column] = value
     bump_data_version()
 
-    threading.Thread(target=_async_save_csv, args=(businesses.copy(),), daemon=True).start()
+    if DATA_SOURCE == "csv":
+        threading.Thread(target=_async_save_csv, args=(businesses.copy(),), daemon=True).start()
 
     return datetime.now().isoformat(), False
 
@@ -2409,7 +2575,7 @@ def toggle_favourite(n_clicks, current_idx):
     else:
         fav_set.discard(biz_name)
         
-    save_favourites(fav_set)
+    persist_favourite_change(biz_name, new_state)
     bump_data_version()
     return n_clicks
 
@@ -2434,28 +2600,21 @@ def manage_comments(add_clicks, delete_clicks_list, current_idx, text):
         if not add_clicks or not text or not text.strip():
             raise PreventUpdate
 
-        comments_dict = load_comments()
-        if business_name not in comments_dict:
-            comments_dict[business_name] = []
-
-        comments_dict[business_name].append({
-            "time": datetime.now().isoformat(),
-            "text": text.strip(),
-        })
-        save_comments(comments_dict)
+        add_comment(business_name, text.strip())
         return add_clicks, ""
 
     elif isinstance(triggered_id, dict) and triggered_id.get("type") == "delete-comment-btn":
         comment_idx = triggered_id["index"]
-        comments_dict = load_comments()
-        if business_name not in comments_dict:
-            raise PreventUpdate
+        if DATA_SOURCE == "supabase":
+            delete_comment(business_name, comment_idx)
+            return datetime.now().timestamp(), text
 
-        comments = comments_dict[business_name]
+        comments_dict = load_comments()
+        comments = comments_dict.get(business_name, [])
         if 0 <= comment_idx < len(comments):
             comments.pop(comment_idx)
             if not comments:
-                del comments_dict[business_name]
+                comments_dict.pop(business_name, None)
             save_comments(comments_dict)
             return datetime.now().timestamp(), text
 
