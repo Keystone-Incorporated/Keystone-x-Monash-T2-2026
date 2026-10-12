@@ -1241,6 +1241,9 @@ def _match_score_series(data, distances, proximity, category_filters, industry_f
     selected_categories = {str(value).strip() for value in (category_filters or []) if str(value).strip()}
     selected_industries = {str(value).strip() for value in (industry_filters or []) if str(value).strip()}
     context = ranking_context if isinstance(ranking_context, dict) else {}
+    if (selected_categories != set(context.get("category_filters") or [])
+            or selected_industries != set(context.get("industry_filters") or [])):
+        context = {}
     ai_category_order = [
         str(value).strip()
         for value in (context.get("category_order") or [])
@@ -2177,7 +2180,11 @@ def apply_ai_filters(_clicks, _submit, text):
         f["accessibility"], f["review_count"],
         0, "",
         _ai_status_children(result),
-        {"category_order": list(dict.fromkeys(result["direct"] + result["related"]))},
+        {
+            "category_order": list(dict.fromkeys(result["direct"] + result["related"])),
+            "category_filters": f["category"],
+            "industry_filters": f["industry"],
+        },
     )
 
 
@@ -2358,7 +2365,7 @@ def set_proximity(_submit_clicks, _n_submit, _clear_clicks, radius, address, cur
 
 def _proximity_status(loc):
     note = " (approximate, based on the suburb)" if loc.get("approximate") else ""
-    return _ai_notice(f"Showing businesses within {loc['radius']} km of {loc['label']}{note}, closest first.")
+    return _ai_notice(f"Showing businesses within {loc['radius']} km of {loc['label']}{note}.")
 
 
 # ── Map View ──────────────────────────────────────────────────────────────────
