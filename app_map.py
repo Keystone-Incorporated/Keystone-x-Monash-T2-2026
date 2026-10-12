@@ -466,6 +466,17 @@ PROXIMITY_ZOOM = {1: 13.5, 2: 12.5, 5: 11.3, 10: 10.3, 20: 9.3}
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 GEOCODER_USER_AGENT = os.getenv("GEOCODER_USER_AGENT", "KeystoneEmployerDashboard/1.0")
 VIC_VIEWBOX = "140.9,-33.9,150.1,-39.3"
+PROXIMITY_MINUTE_OPTIONS = [10, 15, 20, 30, 45, 60]
+PROXIMITY_DEFAULT_MINUTES = 30
+ESTIMATE_DETOUR = 1.3
+ESTIMATE_MODES = {
+    "walk": {"label": "Walking", "icon": "🚶", "kmh": 5.0, "extra_min": 0},
+    "cycle": {"label": "Cycling", "icon": "🚲", "kmh": 15.0, "extra_min": 0},
+    "transit": {"label": "Public transport", "icon": "🚆", "kmh": 18.0, "extra_min": 10},
+    "drive": {"label": "Driving", "icon": "🚗", "kmh": 30.0, "extra_min": 3},
+}
+PROXIMITY_DEFAULT_MODES = list(ESTIMATE_MODES)
+ESTIMATE_COL = "Est. time"
 
 
 def distance_km_from(data, lat, lon):
@@ -547,7 +558,123 @@ def geocode_address(text):
     text = (text or "").strip()
     if not text:
         return None
-    return _nominatim_lookup(text) or _suburb_lookup(text)
+    cleaned = re.sub(r",?\s*Australia\s*$", "", text, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+VIC\b", "", cleaned).strip(" ,")
+    return _nominatim_lookup(cleaned or text) or _suburb_lookup(text)
+
+
+def _clean_modes(modes):
+    return [mode for mode in (modes or []) if mode in ESTIMATE_MODES]
+
+
+def _estimate_minutes(distance_km, mode):
+    spec = ESTIMATE_MODES[mode]
+    return spec["extra_min"] + distance_km * ESTIMATE_DETOUR / spec["kmh"] * 60.0
+
+
+def _estimate_radius_km(minutes, modes):
+    best = 0.0
+    for mode in _clean_modes(modes):
+        spec = ESTIMATE_MODES[mode]
+        usable = max(0.0, float(minutes) - spec["extra_min"])
+        best = max(best, usable / 60.0 * spec["kmh"] / ESTIMATE_DETOUR)
+    return best
+
+
+def _estimate_labels(distances, proximity):
+    modes = _clean_modes((proximity or {}).get("modes")) or list(ESTIMATE_MODES)
+    labels = []
+    for distance in pd.to_numeric(distances, errors="coerce").to_numpy(dtype=float):
+        if not np.isfinite(distance):
+            labels.append("")
+            continue
+        mode = min(modes, key=lambda m: _estimate_minutes(distance, m))
+        minutes = max(1, int(round(_estimate_minutes(distance, mode))))
+        labels.append(f"{minutes} min {ESTIMATE_MODES[mode]['icon']}")
+    return labels
+
+
+def _modes_text(modes):
+    names = [ESTIMATE_MODES[mode]["label"].lower() for mode in _clean_modes(modes)]
+    if len(names) <= 1:
+        return "".join(names)
+    return ", ".join(names[:-1]) + " or " + names[-1]
+
+
+def _proximity_zoom(radius):
+    if radius in PROXIMITY_ZOOM:
+        return PROXIMITY_ZOOM[radius]
+    return float(np.clip(13.5 - np.log2(max(float(radius), 0.5)), 8.0, 15.0))
+
+
+_BUSINESS_NAME_LIST = sorted(
+    {str(name).strip() for name in businesses["Business Name"].dropna() if str(name).strip()},
+    key=str.lower,
+)
+_BUSINESS_NAME_LOWER = [name.lower() for name in _BUSINESS_NAME_LIST]
+
+
+def business_name_suggestions(text, limit=8):
+    query = (text or "").strip().lower()
+    if len(query) < 2:
+        return []
+    starts = [name for name, low in zip(_BUSINESS_NAME_LIST, _BUSINESS_NAME_LOWER) if low.startswith(query)]
+    if len(starts) >= limit:
+        return starts[:limit]
+    contains = [name for name, low in zip(_BUSINESS_NAME_LIST, _BUSINESS_NAME_LOWER) if query in low and not low.startswith(query)]
+    return (starts + contains)[:limit]
+
+
+PLACES_AUTOCOMPLETE_URL = "https://places.googleapis.com/v1/places:autocomplete"
+_PLACES_CACHE = {}
+_PLACES_CACHE_MAX = 2000
+_PLACES_LOCK = threading.Lock()
+_PLACES_BLOCKED_UNTIL = [0.0]
+
+
+def address_suggestions(text, limit=5):
+    text = (text or "").strip()
+    api_key = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
+    if not api_key or len(text) < 4 or time.monotonic() < _PLACES_BLOCKED_UNTIL[0]:
+        return []
+    key = text.lower()
+    cached = _PLACES_CACHE.get(key)
+    if cached is not None:
+        return list(cached)
+    body = {
+        "input": text,
+        "includedRegionCodes": ["au"],
+        "locationRestriction": {"rectangle": {"low": {"latitude": -39.3, "longitude": 140.9}, "high": {"latitude": -33.9, "longitude": 150.1}}},
+    }
+    req = urllib.request.Request(
+        PLACES_AUTOCOMPLETE_URL,
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json", "X-Goog-Api-Key": api_key},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as err:
+        if err.code in (401, 403):
+            _PLACES_BLOCKED_UNTIL[0] = time.monotonic() + 600
+        elif err.code == 429:
+            _PLACES_BLOCKED_UNTIL[0] = time.monotonic() + 60
+        return []
+    except Exception:
+        return []
+    found = []
+    for suggestion in (payload.get("suggestions") or []) if isinstance(payload, dict) else []:
+        label = str((((suggestion or {}).get("placePrediction") or {}).get("text") or {}).get("text") or "").strip()
+        label = re.sub(r",?\s*Australia\s*$", "", label, flags=re.IGNORECASE)
+        if label and label not in found:
+            found.append(label)
+    found = found[:limit]
+    with _PLACES_LOCK:
+        if len(_PLACES_CACHE) >= _PLACES_CACHE_MAX:
+            _PLACES_CACHE.pop(next(iter(_PLACES_CACHE)), None)
+        _PLACES_CACHE[key] = list(found)
+    return found
 
 
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
@@ -1225,6 +1352,7 @@ def table_columns(with_distance=False, with_match_score=False):
         cols.insert(1, MATCH_SCORE_COL)
     if with_distance:
         cols.insert(2 if with_match_score else 1, DISTANCE_COL)
+        cols.insert(cols.index(DISTANCE_COL) + 1, ESTIMATE_COL)
     return [
         {"name": c, "id": c, "presentation": "markdown" if c == "Website" else "input", "editable": False}
         for c in cols
@@ -1414,7 +1542,7 @@ def _make_view(center, zoom):
 def _default_map_view(mask=None, origin=None):
     if origin and origin.get("lat") is not None:
         center = {"lat": float(origin["lat"]), "lon": float(origin["lon"])}
-        zoom = PROXIMITY_ZOOM.get(int(origin.get("radius") or PROXIMITY_DEFAULT_RADIUS), 11)
+        zoom = _proximity_zoom(float(origin.get("radius") or PROXIMITY_DEFAULT_RADIUS))
         return _make_view(center, zoom)
     sel = _MAP_VALID if mask is None else (mask & _MAP_VALID)
     if sel.any():
@@ -1758,14 +1886,14 @@ dashboard_layout = html.Div(
                                     style={"display": "flex", "gap": "10px", "marginTop": "8px", "flexWrap": "wrap"},
                                     children=[
                                         dcc.Input(
-                                            id="proximity-address", type="text", n_submit=0, maxLength=200,
+                                            id="proximity-address", type="text", n_submit=0, maxLength=200, list="address-suggestions",
                                             placeholder="Enter an address or suburb, e.g. Wellington Rd, Clayton",
                                             style={"flex": "1", "minWidth": "240px", "padding": "14px", "borderRadius": "10px", "border": "1px solid #CCCCCC", "fontSize": "16px", "height": "48px"},
                                         ),
                                         dcc.Dropdown(
-                                            id="proximity-radius", clearable=False, searchable=False,
-                                            value=PROXIMITY_DEFAULT_RADIUS,
-                                            options=[{"label": f"Within {r} km", "value": r} for r in PROXIMITY_RADIUS_OPTIONS],
+                                            id="proximity-minutes", clearable=False, searchable=False,
+                                            value=PROXIMITY_DEFAULT_MINUTES,
+                                            options=[{"label": f"Within {m} min", "value": m} for m in PROXIMITY_MINUTE_OPTIONS],
                                             style={"width": "160px", "alignSelf": "center"},
                                         ),
                                         html.Button(
@@ -1778,8 +1906,23 @@ dashboard_layout = html.Div(
                                         ),
                                     ],
                                 ),
+                                html.Datalist(id="address-suggestions", children=[]),
+                                dcc.Store(id="address-typed", data=None),
+                                dcc.Checklist(
+                                    id="proximity-modes",
+                                    options=[{"label": f" {spec['icon']} {spec['label']}", "value": key} for key, spec in ESTIMATE_MODES.items()],
+                                    value=PROXIMITY_DEFAULT_MODES,
+                                    inline=True,
+                                    style={"marginTop": "12px", "color": "#2E1654", "fontSize": "15px"},
+                                    inputStyle={"marginRight": "6px", "cursor": "pointer"},
+                                    labelStyle={"marginRight": "20px", "cursor": "pointer"},
+                                ),
                                 dcc.Loading(type="dot", color="#4200A8", children=html.Div(id="proximity-status", style={"marginTop": "12px", "minHeight": "20px"})),
-                                html.Small("Distances are straight-line. The address is only used to find its location and isn't saved.", style={"color": "#6F5A8C"}),
+                                html.Small(
+                                    "Times are estimates from straight line distance and typical speeds. Open a business for exact Google times. The address is only used to find its location and isn't saved."
+                                    + (" Address suggestions by Google." if os.getenv("GOOGLE_MAPS_API_KEY", "").strip() else ""),
+                                    style={"color": "#6F5A8C"},
+                                ),
                                 dcc.Store(id="proximity-store", data=None),
                                 dcc.Store(id="ranking-context", data=None),
                             ],
@@ -1787,9 +1930,10 @@ dashboard_layout = html.Div(
 
                         html.Label("🔍 Search businesses", style={"fontWeight": "bold", "color": "#2E1654"}),
                         dcc.Input(
-                            id="search-input", type="text", placeholder="Search by business name...", debounce=True,
+                            id="search-input", type="text", placeholder="Search by business name...", debounce=0.4, list="business-name-suggestions",
                             style={"width": "100%", "padding": "14px", "marginTop": "8px", "borderRadius": "10px", "border": "1px solid #CCCCCC", "fontSize": "16px", "height": "48px"},
                         ),
+                        html.Datalist(id="business-name-suggestions", children=[]),
                     ],
                 ),
 
@@ -2293,6 +2437,7 @@ def update_table_server_side(page_current, page_size, sort_by, search, industry,
         display_data.insert(1, MATCH_SCORE_COL, match_scores.loc[page_slice.index].round().astype(int))
     if distances is not None:
         display_data.insert(2 if ranking_active else 1, DISTANCE_COL, distances.loc[page_slice.index].round(1))
+        display_data.insert(display_data.columns.get_loc(DISTANCE_COL) + 1, ESTIMATE_COL, _estimate_labels(distances.loc[page_slice.index], proximity))
 
     display_data["Website"] = display_data["Website"].apply(
         lambda link: f"[🌐 Website]({link})" if str(link).strip() else ""
@@ -2303,7 +2448,10 @@ def update_table_server_side(page_current, page_size, sort_by, search, industry,
         rec["id"] = rec["_row_idx"]
 
     if has_origin:
-        count_text = f"{total_rows} businesses found within {proximity.get('radius')} km of {proximity.get('label')}"
+        if proximity.get("minutes") and _clean_modes(proximity.get("modes")):
+            count_text = f"{total_rows} businesses about {proximity.get('minutes')} minutes or less from {proximity.get('label')}"
+        else:
+            count_text = f"{total_rows} businesses found within {proximity.get('radius')} km of {proximity.get('label')}"
     else:
         count_text = f"{total_rows} businesses found"
 
@@ -2330,14 +2478,16 @@ def update_table_server_side(page_current, page_size, sort_by, search, industry,
     Input("proximity-submit-btn", "n_clicks"),
     Input("proximity-address", "n_submit"),
     Input("proximity-clear-btn", "n_clicks"),
-    Input("proximity-radius", "value"),
+    Input("proximity-minutes", "value"),
+    Input("proximity-modes", "value"),
     State("proximity-address", "value"),
     State("proximity-store", "data"),
     prevent_initial_call=True,
 )
-def set_proximity(_submit_clicks, _n_submit, _clear_clicks, radius, address, current):
+def set_proximity(_submit_clicks, _n_submit, _clear_clicks, minutes, modes, address, current):
     trig = ctx.triggered_id
-    radius = radius or PROXIMITY_DEFAULT_RADIUS
+    minutes = minutes or PROXIMITY_DEFAULT_MINUTES
+    modes = _clean_modes(modes)
 
     if trig == "proximity-clear-btn":
         return None, "", "", 0
@@ -2345,11 +2495,20 @@ def set_proximity(_submit_clicks, _n_submit, _clear_clicks, radius, address, cur
     address = (address or "").strip()
     has_current = bool(current and current.get("lat") is not None)
 
-    if trig == "proximity-radius":
+    if not modes:
+        if trig in ("proximity-minutes", "proximity-modes") and not has_current:
+            raise PreventUpdate
+        return no_update, _ai_notice("Pick at least one way of getting there.", "error"), no_update, no_update
+
+    radius = _estimate_radius_km(minutes, modes)
+    if radius <= 0:
+        return no_update, _ai_notice(f"{minutes} minutes is too short to get anywhere by {_modes_text(modes)} in our estimate. Try a longer time.", "error"), no_update, no_update
+
+    if trig in ("proximity-minutes", "proximity-modes"):
         if not has_current:
             raise PreventUpdate
         if not address or address == current.get("query"):
-            updated = {**current, "radius": radius}
+            updated = {**current, "radius": radius, "minutes": minutes, "modes": modes}
             return updated, _proximity_status(updated), no_update, 0
 
     if not address:
@@ -2359,13 +2518,50 @@ def set_proximity(_submit_clicks, _n_submit, _clear_clicks, radius, address, cur
     if not found:
         return None, _ai_notice("Couldn't find that address. Try adding the suburb, e.g. '… , Clayton'.", "error"), no_update, 0
 
-    found = {**found, "radius": radius, "query": address}
+    found = {**found, "radius": radius, "minutes": minutes, "modes": modes, "query": address}
     return found, _proximity_status(found), no_update, 0
 
 
 def _proximity_status(loc):
     note = " (approximate, based on the suburb)" if loc.get("approximate") else ""
+    modes = _clean_modes(loc.get("modes"))
+    if loc.get("minutes") and modes:
+        return _ai_notice(f"Showing businesses about {loc['minutes']} minutes or less from {loc['label']}{note} by {_modes_text(modes)}. Times are estimates.")
     return _ai_notice(f"Showing businesses within {loc['radius']} km of {loc['label']}{note}.")
+
+
+@app.callback(
+    Output("business-name-suggestions", "children"),
+    Input("search-input", "value"),
+    prevent_initial_call=True,
+)
+def suggest_business_names(text):
+    return [html.Option(value=name) for name in business_name_suggestions(text)]
+
+
+app.clientside_callback(
+    "function(value) {"
+    " return new Promise(function(resolve) {"
+    " setTimeout(function() {"
+    " var el = document.getElementById('proximity-address');"
+    " var current = el ? el.value : value;"
+    " resolve(current === value ? value : window.dash_clientside.no_update);"
+    " }, 350);"
+    " });"
+    " }",
+    Output("address-typed", "data"),
+    Input("proximity-address", "value"),
+    prevent_initial_call=True,
+)
+
+
+@app.callback(
+    Output("address-suggestions", "children"),
+    Input("address-typed", "data"),
+    prevent_initial_call=True,
+)
+def suggest_addresses(text):
+    return [html.Option(value=label) for label in address_suggestions(text)]
 
 
 # ── Map View ──────────────────────────────────────────────────────────────────
