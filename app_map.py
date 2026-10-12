@@ -1213,16 +1213,103 @@ def favourites_toggle():
 
 TABLE_COLS = ["Business Name", "Phone", "Website", "Suburb", "Industry"]
 DISTANCE_COL = "Distance (km)"
+MATCH_SCORE_COL = "Match Score"
+_MAX_LOG_REVIEW_COUNT = float(np.log1p(
+    pd.to_numeric(businesses["Reviews Count"], errors="coerce").fillna(0).clip(lower=0).max()
+))
 
 
-def table_columns(with_distance=False):
+def table_columns(with_distance=False, with_match_score=False):
     cols = list(TABLE_COLS)
+    if with_match_score:
+        cols.insert(1, MATCH_SCORE_COL)
     if with_distance:
-        cols.insert(1, DISTANCE_COL)
+        cols.insert(2 if with_match_score else 1, DISTANCE_COL)
     return [
         {"name": c, "id": c, "presentation": "markdown" if c == "Website" else "input", "editable": False}
         for c in cols
     ] + [{"name": "_row_idx", "id": "_row_idx", "editable": False}]
+
+
+def _match_score_series(data, distances, proximity, category_filters, industry_filters, ranking_context):
+    """Score already-filtered candidate rows; missing components are reweighted to 0–100."""
+    components = []
+    weights = []
+
+    categories = data["Category"].astype(str).str.strip()
+    industries = data["Industry"].astype(str).str.strip()
+    selected_categories = {str(value).strip() for value in (category_filters or []) if str(value).strip()}
+    selected_industries = {str(value).strip() for value in (industry_filters or []) if str(value).strip()}
+    context = ranking_context if isinstance(ranking_context, dict) else {}
+    ai_category_order = [
+        str(value).strip()
+        for value in (context.get("category_order") or [])
+        if str(value).strip()
+    ]
+
+    if selected_categories or selected_industries:
+        present_categories = set(categories.unique())
+        if selected_categories:
+            relevant_order = [
+                value for value in ai_category_order
+                if value in selected_categories and value in present_categories
+            ]
+        elif ai_category_order and selected_industries:
+            category_col = businesses["Category"].astype(str).str.strip()
+            industry_col = businesses["Industry"].astype(str).str.strip()
+            eligible_mask = category_col.isin(ai_category_order) & industry_col.isin(selected_industries)
+            eligible_categories = set(category_col.loc[eligible_mask])
+            relevant_order = [
+                value for value in ai_category_order
+                if value in eligible_categories and value in present_categories
+            ]
+        else:
+            relevant_order = []
+
+        relevance = np.zeros(len(data), dtype=float)
+        industry_match = industries.isin(selected_industries).to_numpy() if selected_industries else np.zeros(len(data), dtype=bool)
+        relevance[industry_match] = 0.40
+
+        if relevant_order:
+            rank_by_category = {value: rank for rank, value in enumerate(relevant_order)}
+            ranked_count = len(relevant_order)
+            for category, rank in rank_by_category.items():
+                relevance[categories.eq(category).to_numpy()] = 0.65 + 0.35 * (ranked_count - rank) / ranked_count
+            manual_category_match = categories.isin(selected_categories - set(relevant_order)).to_numpy()
+            relevance[manual_category_match] = np.maximum(relevance[manual_category_match], 0.65)
+        elif selected_categories:
+            relevance[categories.isin(selected_categories).to_numpy()] = 0.85
+
+        components.append(relevance)
+        weights.append(0.55)
+
+    if distances is not None:
+        radius = float((proximity or {}).get("radius") or PROXIMITY_DEFAULT_RADIUS)
+        distance_values = pd.to_numeric(distances.reindex(data.index), errors="coerce").to_numpy(dtype=float)
+        distance_score = np.clip(1.0 - distance_values / max(radius, 0.1), 0.0, 1.0)
+        components.append(np.nan_to_num(distance_score, nan=0.0, posinf=0.0, neginf=0.0))
+        weights.append(0.25)
+
+    rating = pd.to_numeric(data["Total Score"], errors="coerce").fillna(0).clip(0, 5).to_numpy(dtype=float) / 5.0
+    reviews = pd.to_numeric(data["Reviews Count"], errors="coerce").fillna(0).clip(lower=0).to_numpy(dtype=float)
+    review_score = np.log1p(reviews) / _MAX_LOG_REVIEW_COUNT if _MAX_LOG_REVIEW_COUNT > 0 else np.zeros(len(data), dtype=float)
+    business_signal = 0.70 * rating + 0.30 * review_score
+    components.append(np.clip(business_signal, 0.0, 1.0))
+    weights.append(0.15)
+
+    contact_fields = [column for column in ("Phone", "Email", "Website") if column in data.columns]
+    contact_count = np.zeros(len(data), dtype=float)
+    for column in contact_fields:
+        contact_count += data[column].fillna("").astype(str).str.strip().ne("").to_numpy(dtype=float)
+    contactability = contact_count / 3.0
+    components.append(contactability)
+    weights.append(0.05)
+
+    weighted_total = np.zeros(len(data), dtype=float)
+    for component, weight in zip(components, weights):
+        weighted_total += component * weight
+    scores = weighted_total / sum(weights) * 100.0 if weights else np.zeros(len(data), dtype=float)
+    return pd.Series(np.clip(scores, 0.0, 100.0), index=data.index)
 
 # ── Map view config (CARTO basemap) ───────────────────────────────────────────
 CARTO_API_KEY = os.getenv("CARTO_API_KEY", "")
@@ -1691,6 +1778,7 @@ dashboard_layout = html.Div(
                                 dcc.Loading(type="dot", color="#4200A8", children=html.Div(id="proximity-status", style={"marginTop": "12px", "minHeight": "20px"})),
                                 html.Small("Distances are straight-line. The address is only used to find its location and isn't saved.", style={"color": "#6F5A8C"}),
                                 dcc.Store(id="proximity-store", data=None),
+                                dcc.Store(id="ranking-context", data=None),
                             ],
                         ),
 
@@ -2050,6 +2138,7 @@ def toggle_favourites_filter(_n_clicks, current):
     Output("business-table", "page_current", allow_duplicate=True),
     Output("search-input", "value", allow_duplicate=True),
     Output("ai-status", "children"),
+    Output("ranking-context", "data"),
     Input("ai-submit-btn", "n_clicks"),
     Input("ai-input", "n_submit"),
     State("ai-input", "value"),
@@ -2061,7 +2150,7 @@ def apply_ai_filters(_clicks, _submit, text):
         raise PreventUpdate
 
     def _leave_filters_alone(notice):
-        return (no_update,) * 8 + (notice,)
+        return (no_update,) * 8 + (notice, no_update)
 
     if _ai_client is None:
         return _leave_filters_alone(_ai_notice("AI search isn't switched on (no API key configured). You can still use the filters.", "error"))
@@ -2088,6 +2177,7 @@ def apply_ai_filters(_clicks, _submit, text):
         f["accessibility"], f["review_count"],
         0, "",
         _ai_status_children(result),
+        {"category_order": list(dict.fromkeys(result["direct"] + result["related"]))},
     )
 
 
@@ -2095,6 +2185,7 @@ def apply_ai_filters(_clicks, _submit, text):
 @app.callback(
     Output("business-table", "data"),
     Output("business-table", "columns"),
+    Output("business-table", "sort_action"),
     Output("business-table", "page_count"),
     Output("result-count", "children"),
     Output({"type": "msf-store", "index": "industry"}, "data"),
@@ -2118,8 +2209,9 @@ def apply_ai_filters(_clicks, _submit, text):
     Input("auth-session", "data"),
     Input("edit-save-trigger", "data"),
     Input("proximity-store", "data"),
+    Input("ranking-context", "data"),
 )
-def update_table_server_side(page_current, page_size, sort_by, search, industry, category, council_area, suburb, accessibility, review_count, fav_only, _trig, _auth, _edit, proximity):
+def update_table_server_side(page_current, page_size, sort_by, search, industry, category, council_area, suburb, accessibility, review_count, fav_only, _trig, _auth, _edit, proximity, ranking_context):
     # Note: this callback intentionally does NOT listen to the msf-clear (✕)
     # buttons directly. Those buttons only clear the checklist's own "value"
     # (via msf_value_actions); this callback reacts to that value change
@@ -2151,20 +2243,28 @@ def update_table_server_side(page_current, page_size, sort_by, search, industry,
             distance_km_from(filtered, proximity["lat"], proximity["lon"]), index=filtered.index
         )
 
-    sort_col = sort_by[0]["column_id"] if sort_by else None
-    if sort_col == DISTANCE_COL and distances is None:
-        sort_col = None
-
-    if sort_col:
-        ascending = sort_by[0]["direction"] == "asc"
-        if sort_col == DISTANCE_COL:
-            filtered = filtered.loc[distances.sort_values(ascending=ascending, kind="stable").index]
-        elif sort_col in filtered.columns:
-            filtered = filtered.sort_values(by=sort_col, ascending=ascending)
-    elif distances is not None:
-        filtered = filtered.loc[distances.sort_values(kind="stable").index]
+    ranking_active = bool(category or industry or has_origin)
+    match_scores = None
+    if ranking_active:
+        match_scores = _match_score_series(
+            filtered, distances, proximity, category, industry, ranking_context
+        )
+        filtered = filtered.loc[match_scores.sort_values(ascending=False, kind="stable").index]
     else:
-        filtered = filtered.sort_values(by="_is_fav", ascending=False)
+        sort_col = sort_by[0]["column_id"] if sort_by else None
+        if sort_col == DISTANCE_COL and distances is None:
+            sort_col = None
+
+        if sort_col:
+            ascending = sort_by[0]["direction"] == "asc"
+            if sort_col == DISTANCE_COL:
+                filtered = filtered.loc[distances.sort_values(ascending=ascending, kind="stable").index]
+            elif sort_col in filtered.columns:
+                filtered = filtered.sort_values(by=sort_col, ascending=ascending)
+        elif distances is not None:
+            filtered = filtered.loc[distances.sort_values(kind="stable").index]
+        else:
+            filtered = filtered.sort_values(by="_is_fav", ascending=False)
 
     total_rows = len(filtered)
     page_count = max(1, (total_rows + page_size - 1) // page_size)
@@ -2182,8 +2282,10 @@ def update_table_server_side(page_current, page_size, sort_by, search, industry,
 
     display_data = page_slice[TABLE_COLS].copy()
     display_data["_row_idx"] = page_slice.index
+    if ranking_active:
+        display_data.insert(1, MATCH_SCORE_COL, match_scores.loc[page_slice.index].round().astype(int))
     if distances is not None:
-        display_data.insert(1, DISTANCE_COL, distances.loc[page_slice.index].round(1))
+        display_data.insert(2 if ranking_active else 1, DISTANCE_COL, distances.loc[page_slice.index].round(1))
 
     display_data["Website"] = display_data["Website"].apply(
         lambda link: f"[🌐 Website]({link})" if str(link).strip() else ""
@@ -2200,7 +2302,8 @@ def update_table_server_side(page_current, page_size, sort_by, search, industry,
 
     return (
         records,
-        table_columns(with_distance=has_origin),
+        table_columns(with_distance=has_origin, with_match_score=ranking_active),
+        "none" if ranking_active else "custom",
         page_count,
         count_text,
         make_options(businesses.loc[ind_mask, "Industry"].unique()),

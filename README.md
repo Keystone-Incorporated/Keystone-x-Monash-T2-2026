@@ -41,6 +41,16 @@ Then open your browser and go to:
 
 http://127.0.0.1:8055/
 
+## Match ranking
+
+The table shows a 0–100 `Match Score` and sorts highest-first when an industry/category
+filter or a proximity location is active. Existing filters, including accessibility,
+remain hard constraints. The score combines relevance (55%), distance (25%), business
+signal (15%), and contactability (5%); unavailable components are omitted and the
+remaining weights are normalized. AI category order is preserved, with category matches
+scoring above industry-only matches. Business signal combines rating with log-scaled
+review count; the score is a ranking aid, not an employer-quality rating.
+
 ## Deployment
 
 The dashboard is currently hosted on Render.
