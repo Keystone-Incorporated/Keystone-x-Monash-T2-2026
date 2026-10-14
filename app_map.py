@@ -1620,6 +1620,11 @@ def _build_map_figure(map_df, view, origin=None):
     center, zoom = view["center"], view["zoom"]
     fig = go.Figure()
 
+    # Plotly only draws a map if at least one Scattermapbox trace exists. With zero matching
+    # businesses the figure used to degrade into empty x/y axes and the user couldn't zoom back out.
+    # An empty placeholder trace keeps the map alive.
+    fig.add_trace(go.Scattermapbox(lat=[], lon=[], mode="markers", hoverinfo="skip", showlegend=False))
+
     if len(map_df) > 0:
         fig.add_trace(go.Scattermapbox(
             lat=map_df["Latitude"],
@@ -1745,6 +1750,17 @@ app.index_string = """
             overflow: hidden; display: flex; flex-direction: column; box-shadow: 0 20px 50px rgba(0,0,0,0.3);
             pointer-events: auto;
         }
+        .proximity-minutes-dd { height: 48px !important; min-height: 48px !important; font-family: Arial, sans-serif; font-size: 15px; font-weight: bold; color: #2E1654; }
+        .proximity-minutes-dd .Select-control { height: 48px !important; border: 1px solid #D9CCFF !important; border-radius: 10px !important; background: white; box-shadow: none !important; cursor: pointer; }
+        .proximity-minutes-dd .Select-value, .proximity-minutes-dd .Select-placeholder { line-height: 46px !important; padding-left: 14px; }
+        .proximity-minutes-dd .Select-value-label { color: #2E1654 !important; font-weight: bold; }
+        .proximity-minutes-dd .Select-input { height: 46px; }
+        .proximity-minutes-dd .Select-arrow-zone { padding-right: 12px; }
+        .proximity-minutes-dd .Select-menu-outer { border: 1px solid #D9CCFF; border-radius: 10px; margin-top: 4px; overflow: hidden; }
+        .proximity-minutes-dd .Select-option { font-weight: normal; color: #2E1654; }
+        .proximity-minutes-dd .Select-option.is-focused, .proximity-minutes-dd .Select-option.is-selected { background: #F8F5FF; }
+        .proximity-minutes-dd.dash-dropdown, .proximity-minutes-dd .dash-dropdown { height: 48px; border: 1px solid #D9CCFF; border-radius: 10px; font-weight: bold; font-size: 15px; color: #2E1654; background: white; box-sizing: border-box; }
+        .proximity-minutes-dd .dash-dropdown-trigger { height: 100%; min-height: 0; border: none; border-radius: 10px; font-weight: bold; font-size: 15px; color: #2E1654; }
         .msf { position: relative; font-family: Arial, sans-serif; align-self: start; }
         .msf-toggle {
             width: 100%; height: 48px; display: flex; align-items: center; justify-content: space-between;
@@ -1864,26 +1880,12 @@ dashboard_layout = html.Div(
                             ],
                         ),
 
-                        # Filters placed ABOVE search bar
                         html.Div(
-                            style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit, minmax(190px, 1fr))", "gap": "16px", "marginBottom": "20px"},
-                            children=[
-                                multi_filter("industry", "🏭 Industry", options=INDUSTRY_OPTIONS),
-                                html.Div(id="category-filter-wrapper", style={"display": "none"}, children=[multi_filter("category", "📂 Category", options=CATEGORY_OPTIONS)]),
-                                multi_filter("council_area", "🏛️ Council Area", options=COUNCIL_OPTIONS),
-                                html.Div(id="suburb-filter-wrapper", style={"display": "none"}, children=[multi_filter("suburb", "📍 Suburb", options=SUBURB_OPTIONS)]),
-                                multi_filter("review_count", "💬 Review count", options=REVIEW_COUNT_OPTIONS),
-                                multi_filter("accessibility", "⚙️ Advanced Options", options=ADVANCED_OPTIONS),
-                                favourites_toggle(),
-                            ],
-                        ),
-                        
-                        html.Div(
-                            style={"background": "#F8F5FF", "border": "1px solid #D9CCFF", "borderRadius": "14px", "padding": "18px", "marginBottom": "22px"},
+                            style={"background": "#F8F5FF", "border": "1px solid #D9CCFF", "borderRadius": "14px", "padding": "12px 18px", "marginBottom": "18px"},
                             children=[
                                 html.Label("📍 Near an address", style={"fontWeight": "bold", "color": "#2E1654"}),
                                 html.Div(
-                                    style={"display": "flex", "gap": "10px", "marginTop": "8px", "flexWrap": "wrap"},
+                                    style={"display": "flex", "gap": "10px", "marginTop": "8px", "flexWrap": "wrap", "alignItems": "stretch"},
                                     children=[
                                         dcc.Input(
                                             id="proximity-address", type="text", n_submit=0, maxLength=200, list="address-suggestions",
@@ -1894,7 +1896,8 @@ dashboard_layout = html.Div(
                                             id="proximity-minutes", clearable=False, searchable=False,
                                             value=PROXIMITY_DEFAULT_MINUTES,
                                             options=[{"label": f"Within {m} min", "value": m} for m in PROXIMITY_MINUTE_OPTIONS],
-                                            style={"width": "160px", "alignSelf": "center"},
+                                            className="proximity-minutes-dd",
+                                            style={"width": "160px", "height": "48px"},
                                         ),
                                         html.Button(
                                             "Find nearby", id="proximity-submit-btn", n_clicks=0,
@@ -1913,18 +1916,32 @@ dashboard_layout = html.Div(
                                     options=[{"label": f" {spec['icon']} {spec['label']}", "value": key} for key, spec in ESTIMATE_MODES.items()],
                                     value=PROXIMITY_DEFAULT_MODES,
                                     inline=True,
-                                    style={"marginTop": "12px", "color": "#2E1654", "fontSize": "15px"},
+                                    style={"marginTop": "10px", "paddingLeft": "23px", "color": "#2E1654", "fontSize": "15px"},
                                     inputStyle={"marginRight": "6px", "cursor": "pointer"},
                                     labelStyle={"marginRight": "20px", "cursor": "pointer"},
                                 ),
-                                dcc.Loading(type="dot", color="#4200A8", children=html.Div(id="proximity-status", style={"marginTop": "12px", "minHeight": "20px"})),
+                                dcc.Loading(type="dot", color="#4200A8", children=html.Div(id="proximity-status", style={"marginTop": "4px", "minHeight": "0", "paddingLeft": "23px"})),
                                 html.Small(
                                     "Times are estimates from straight line distance and typical speeds. Open a business for exact Google times. The address is only used to find its location and isn't saved."
                                     + (" Address suggestions by Google." if os.getenv("GOOGLE_MAPS_API_KEY", "").strip() else ""),
-                                    style={"color": "#6F5A8C"},
+                                    style={"display": "block", "color": "#6F5A8C", "marginTop": "4px", "paddingLeft": "23px"},
                                 ),
                                 dcc.Store(id="proximity-store", data=None),
                                 dcc.Store(id="ranking-context", data=None),
+                            ],
+                        ),
+
+                        # Filters (below the address box, above the name search)
+                        html.Div(
+                            style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit, minmax(190px, 1fr))", "gap": "16px", "marginBottom": "20px"},
+                            children=[
+                                multi_filter("industry", "🏭 Industry", options=INDUSTRY_OPTIONS),
+                                html.Div(id="category-filter-wrapper", style={"display": "none"}, children=[multi_filter("category", "📂 Category", options=CATEGORY_OPTIONS)]),
+                                multi_filter("council_area", "🏛️ Council Area", options=COUNCIL_OPTIONS),
+                                html.Div(id="suburb-filter-wrapper", style={"display": "none"}, children=[multi_filter("suburb", "📍 Suburb", options=SUBURB_OPTIONS)]),
+                                multi_filter("review_count", "💬 Review count", options=REVIEW_COUNT_OPTIONS),
+                                multi_filter("accessibility", "⚙️ Advanced Options", options=ADVANCED_OPTIONS),
+                                favourites_toggle(),
                             ],
                         ),
 
@@ -1943,7 +1960,10 @@ dashboard_layout = html.Div(
                         html.Div(
                             style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "flexWrap": "wrap", "gap": "12px"},
                             children=[
-                                html.H3("📋 Business results", style={"color": "#2E1654", "fontSize": "24px", "margin": "0"}),
+                                html.H3(
+                                    [html.Span("📋", style={"display": "inline-block", "width": "38px"}), "Business results"],
+                                    style={"color": "#2E1654", "fontSize": "24px", "margin": "0"},
+                                ),
                                 html.Div(
                                     style={"display": "flex", "gap": "8px", "background": "#F8F5FF", "padding": "4px", "borderRadius": "14px"},
                                     children=[
@@ -1959,7 +1979,7 @@ dashboard_layout = html.Div(
                                 ),
                             ],
                         ),
-                        html.Div(id="result-count", style={"color": "#6F5A8C", "marginBottom": "15px", "marginTop": "10px"}),
+                        html.Div(id="result-count", style={"color": "#6F5A8C", "marginBottom": "15px", "marginTop": "10px", "paddingLeft": "38px"}),
 
                         html.Div(
                             id="table-view-container",
@@ -2433,10 +2453,8 @@ def update_table_server_side(page_current, page_size, sort_by, search, industry,
 
     display_data = page_slice[TABLE_COLS].copy()
     display_data["_row_idx"] = page_slice.index
-    if ranking_active:
-        display_data.insert(1, MATCH_SCORE_COL, match_scores.loc[page_slice.index].round().astype(int))
     if distances is not None:
-        display_data.insert(2 if ranking_active else 1, DISTANCE_COL, distances.loc[page_slice.index].round(1))
+        display_data.insert(1, DISTANCE_COL, distances.loc[page_slice.index].round(1))
         display_data.insert(display_data.columns.get_loc(DISTANCE_COL) + 1, ESTIMATE_COL, _estimate_labels(distances.loc[page_slice.index], proximity))
 
     display_data["Website"] = display_data["Website"].apply(
@@ -2457,7 +2475,7 @@ def update_table_server_side(page_current, page_size, sort_by, search, industry,
 
     return (
         records,
-        table_columns(with_distance=has_origin, with_match_score=ranking_active),
+        table_columns(with_distance=has_origin),
         "none" if ranking_active else "custom",
         page_count,
         count_text,
