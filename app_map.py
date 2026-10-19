@@ -1442,6 +1442,26 @@ def _match_score_series(data, distances, proximity, category_filters, industry_f
     scores = weighted_total / sum(weights) * 100.0 if weights else np.zeros(len(data), dtype=float)
     return pd.Series(np.clip(scores, 0.0, 100.0), index=data.index)
 
+def _ai_direct_tier(data, category_filters, industry_filters, ranking_context):
+    """AI search only: 0 for rows in a 'direct' category, 1 for everything else.
+
+    Returns None (so the normal ranking is used untouched) when there is no live AI
+    search, when the user has since changed the category/industry filters by hand, or
+    when the AI found no direct categories (an approximate-only match).
+    """
+    context = ranking_context if isinstance(ranking_context, dict) else {}
+    selected_categories = {str(v).strip() for v in (category_filters or []) if str(v).strip()}
+    selected_industries = {str(v).strip() for v in (industry_filters or []) if str(v).strip()}
+    if (selected_categories != set(context.get("category_filters") or [])
+            or selected_industries != set(context.get("industry_filters") or [])):
+        return None
+    direct = {str(v).strip() for v in (context.get("direct_categories") or []) if str(v).strip()}
+    if not direct:
+        return None
+    is_direct = data["Category"].astype(str).str.strip().isin(direct)
+    return (~is_direct).astype(int)
+
+
 # ── Map view config (CARTO basemap) ───────────────────────────────────────────
 CARTO_API_KEY = os.getenv("CARTO_API_KEY", "")
 CARTO_TILE_URL = f"https://basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}/{{y}}.png?key={CARTO_API_KEY}"
@@ -2346,6 +2366,7 @@ def apply_ai_filters(_clicks, _submit, text):
         _ai_status_children(result),
         {
             "category_order": list(dict.fromkeys(result["direct"] + result["related"])),
+            "direct_categories": list(result["direct"]),
             "category_filters": f["category"],
             "industry_filters": f["industry"],
         },
@@ -2420,7 +2441,15 @@ def update_table_server_side(page_current, page_size, sort_by, search, industry,
         match_scores = _match_score_series(
             filtered, distances, proximity, category, industry, ranking_context
         )
-        filtered = filtered.loc[match_scores.sort_values(ascending=False, kind="stable").index]
+        direct_tier = _ai_direct_tier(filtered, category, industry, ranking_context)
+        if direct_tier is not None:
+            # AI search: direct categories first, then the normal match score within each group.
+            order = pd.DataFrame({"tier": direct_tier, "score": match_scores}).sort_values(
+                by=["tier", "score"], ascending=[True, False], kind="stable"
+            ).index
+            filtered = filtered.loc[order]
+        else:
+            filtered = filtered.loc[match_scores.sort_values(ascending=False, kind="stable").index]
     else:
         sort_col = sort_by[0]["column_id"] if sort_by else None
         if sort_col == DISTANCE_COL and distances is None:
