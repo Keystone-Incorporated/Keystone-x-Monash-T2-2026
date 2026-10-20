@@ -3163,13 +3163,21 @@ def manage_comments(add_clicks, delete_clicks_list, current_idx, text):
             raise PreventUpdate
 
         add_comment(business_name, text.strip())
-        return add_clicks, ""
+        return secrets.token_hex(16), ""
 
     elif isinstance(triggered_id, dict) and triggered_id.get("type") == "delete-comment-btn":
+        # Opening or rebuilding the modal also inserts delete buttons with zero clicks.
+        delete_clicks = next(
+            (item.get("value") for item in ctx.inputs_list[1] if item.get("id") == triggered_id),
+            0,
+        )
+        if not delete_clicks or delete_clicks <= 0:
+            raise PreventUpdate
+
         comment_idx = triggered_id["index"]
         if DATA_SOURCE == "supabase":
             delete_comment(business_name, comment_idx)
-            return datetime.now().timestamp(), text
+            return secrets.token_hex(16), text
 
         comments_dict = load_comments()
         comments = comments_dict.get(business_name, [])
@@ -3178,7 +3186,7 @@ def manage_comments(add_clicks, delete_clicks_list, current_idx, text):
             if not comments:
                 comments_dict.pop(business_name, None)
             save_comments(comments_dict)
-            return datetime.now().timestamp(), text
+            return secrets.token_hex(16), text
 
     raise PreventUpdate
 
