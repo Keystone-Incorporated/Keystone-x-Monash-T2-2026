@@ -999,6 +999,11 @@ def _ai_rate_ok():
         return True
 
 
+# Claude may only tick the wheelchair filter. The other accessibility / sensory / LGBTQ+ options
+# are deliberately left for staff to choose by hand, because the underlying Google data is unreliable.
+AI_ACCESS_FEATURES = [f for f in ADVANCED_OPTIONS_FEATURES if f == "Wheelchair Accessible (Likely)"]
+
+
 def _canon_map(values):
     return {str(v).strip().lower(): str(v).strip() for v in values if str(v).strip()}
 
@@ -1009,7 +1014,7 @@ _CANON = {
     "category": _canon_map(businesses["Category"].astype(str).unique()),
     "council_area": _canon_map(businesses["Council Area"].astype(str).unique()),
     "suburb": _canon_map(businesses["Suburb"].astype(str).unique()),
-    "accessibility": {f.lower(): f for f in ADVANCED_OPTIONS_FEATURES},
+    "accessibility": {f.lower(): f for f in AI_ACCESS_FEATURES},
     "review_count": {o["value"].lower(): o["value"] for o in REVIEW_COUNT_OPTIONS},
 }
 AI_FILTER_KEYS = list(_CANON.keys())
@@ -1085,7 +1090,19 @@ Staff want a WIDE list of workplaces, not just the literal match. Work through t
    names are specific (it may say "Sandwich shop", not "Sandwich bar"), so search the lists for the
    nearest real name and include near-synonyms and sub-types too. Check every industry list, not only
    the obvious one (a librarian's hosts are in education, not just in libraries).
-3. direct_categories = the literal match. related_categories = everything from (b) and (c).
+3. direct_categories = the literal match. This means BOTH (i) the job role itself AND (ii) any venue or
+   organisation whose main purpose is that same activity, i.e. places named after it where that role
+   is done every day. Example: "tennis coach" -> direct = Tennis instructor, Tennis court, Tennis club
+   (not Sports club or Gym, which are only related). "Swimming teacher" -> Swimming instructor,
+   Swimming pool, Swimming club. "Librarian" -> Library. Only count a venue as direct when the
+   activity (or a direct synonym, e.g. soccer = football) is in its name; broader places that merely
+   offer the activity among many stay in related_categories. Generic categories are NEVER direct, even
+   if they would employ such a coach: Sports school, Sports club, Sports complex, Gym, Fitness center,
+   Community center, Coaching center, Training center, Education center, and any school or club for a
+   different sport (e.g. a basketball school for a soccer coach). Example: "soccer coach" -> direct =
+   Soccer club, Football club (plus a soccer/football instructor category if one exists); Sports school
+   goes in related_categories.
+   related_categories = everything from (b) and (c).
    Be generous: 5-20 related categories is normal. Leave related_categories empty only when the
    request is genuinely niche and nothing else fits.
 4. Only mention a category in the explanation if you put it in direct_categories or related_categories.
@@ -1096,9 +1113,10 @@ Staff want a WIDE list of workplaces, not just the literal match. Work through t
   related_categories; "none" when nothing plausible exists.
 
 STEP 3 - OTHER FILTERS (leave EMPTY unless the text explicitly asks)
-- accessibility: only for a need stated in the text (wheelchair user -> "Wheelchair Accessible (Likely)";
-  hearing aid or hearing loss -> "Assistive Hearing Loop"; noise or sensory sensitivity -> "Sensory
-  Sensitivity (Quiet)"; wants a lively/loud place -> "Sensory Sensitivity (Loud)").
+- accessibility: the ONLY value you may ever use is "Wheelchair Accessible (Likely)", and only when the
+  text says the person uses a wheelchair or needs step-free / wheelchair access. Never select any other
+  accessibility, hearing, sensory, family or LGBTQ+ option, even if the text mentions such a need
+  (staff choose those by hand). Do not mention those needs as filters in your explanation.
 - council_area / suburb: only if a place is named. Use exact names listed below.
 - review_count: only if the text asks about small/local vs large/well-known businesses.
 
@@ -1113,7 +1131,7 @@ AVAILABLE INDUSTRIES AND THEIR CATEGORIES (business counts in brackets)
 AVAILABLE COUNCIL AREAS AND THEIR SUBURBS
 {chr(10).join(location_lines)}
 
-ACCESSIBILITY / ADVANCED OPTIONS: {", ".join(ADVANCED_OPTIONS_FEATURES)}
+ACCESSIBILITY / ADVANCED OPTIONS YOU MAY USE: {", ".join(AI_ACCESS_FEATURES)}
 REVIEW COUNT OPTIONS: {", ".join(o["value"] for o in REVIEW_COUNT_OPTIONS)}
 """
 
@@ -1144,7 +1162,7 @@ AI_TOOL = {
             "industry": _str_array,
             "council_area": _str_array,
             "suburb": _str_array,
-            "accessibility": {"type": "array", "items": {"type": "string", "enum": ADVANCED_OPTIONS_FEATURES}},
+            "accessibility": {"type": "array", "items": {"type": "string", "enum": AI_ACCESS_FEATURES}},
             "review_count": {"type": "array", "items": {"type": "string", "enum": [o["value"] for o in REVIEW_COUNT_OPTIONS]}},
             "explanation": {"type": "string"},
         },
@@ -1164,6 +1182,45 @@ def _call_claude(text):
         messages=[{"role": "user", "content": text}],
     )
     return next((blk.input for blk in resp.content if blk.type == "tool_use"), {}) or {}
+
+
+_ROLE_WORDS = {"instructor", "instructors", "coach", "coaches", "coaching", "teacher", "teachers", "trainer",
+               "trainers", "tutor", "tutors", "lessons", "lesson", "classes", "class", "school", "schools",
+               "academy", "player", "players"}
+_GENERIC_SUBJECTS = {"sports", "sport", "fitness", "general", "community", "health", "education", "training",
+                     "business", "centre", "center", "services", "service", "and", "for", "the", "club", "clubs"}
+
+
+_GENERIC_WORDS = {"sports", "sport", "fitness", "school", "schools", "club", "clubs", "complex", "centre", "center",
+                  "community", "coaching", "training", "education", "academy", "venue", "facility", "facilities",
+                  "and", "for", "the", "general", "services", "service", "instructor", "instructors", "coach"}
+
+
+def _demote_generic_direct(direct, related):
+    """Safety net: a direct category must name a specific activity. 'Sports school', 'Coaching center'
+    etc. are made up only of generic words, so they are moved to related."""
+    def is_generic(cat):
+        words = [w for w in re.split(r"[^a-z0-9]+", cat.lower()) if w]
+        return bool(words) and all(w in _GENERIC_WORDS for w in words)
+    generic = [c for c in direct if is_generic(c)]
+    if not generic:
+        return direct, related
+    return [c for c in direct if c not in generic], related + [c for c in generic if c not in related]
+
+
+def _promote_activity_venues(direct, related):
+    """Safety net for the prompt rule: if Claude put e.g. "Tennis instructor" in direct but left
+    "Tennis court" / "Tennis club" in related, move those up. Only categories Claude itself already
+    chose as related are ever moved (nothing is added), and generic subjects like "sports" never trigger it."""
+    subjects = set()
+    for cat in direct:
+        for w in re.split(r"[^a-z0-9]+", cat.lower()):
+            if len(w) >= 4 and w not in _ROLE_WORDS and w not in _GENERIC_SUBJECTS:
+                subjects.add(w)
+    if not subjects:
+        return direct, related
+    promoted = [c for c in related if subjects & set(re.split(r"[^a-z0-9]+", c.lower()))]
+    return direct + promoted, [c for c in related if c not in promoted]
 
 
 def interpret_query(text):
@@ -1192,6 +1249,8 @@ def interpret_query(text):
 
     direct = _resolve_categories(raw.get("direct_categories"))
     related = [c for c in _resolve_categories((raw.get("related_categories") or []) + (raw.get("category") or [])) if c not in direct]
+    direct, related = _demote_generic_direct(direct, related)
+    direct, related = _promote_activity_venues(direct, related)
     direct, related = direct[:AI_MAX_CATEGORIES], related[:max(0, AI_MAX_CATEGORIES - len(direct))]
     clean["category"] = sorted(direct + related)
     if clean["category"] and quality != "none":
@@ -1229,7 +1288,7 @@ AI_FILTER_LABELS = {
     "suburb": "📍 Suburb", "accessibility": "⚙️ Advanced", "review_count": "💬 Reviews",
 }
 
-AI_EXAMPLES = "Try something like: “Likes blacksmithing”, or “Interested in cars, Frankston area”."
+AI_EXAMPLES = "Try something like: “Likes blacksmithing”, or “Wants to be a librarian”."
 
 
 def _ai_notice(message, kind="info"):
@@ -1338,12 +1397,40 @@ def favourites_toggle():
     )
 
 
-TABLE_COLS = ["Business Name", "Phone", "Website", "Suburb", "Industry"]
+WORKPLACE_COL = "Workplace"
+SAME_WORKPLACE = "Same workplace"
+RELATED_WORKPLACE = "Related workplace"
+SAME_COLOR = "#4200A8"      # Keystone purple (same as the original map dots)
+RELATED_COLOR = "#78FFF1"   # Keystone Neon Aqua
+RELATED_TEXT = "#78FFF1"
+TABLE_COLS = ["Business Name", WORKPLACE_COL, "Website", "Suburb", "Industry"]
 DISTANCE_COL = "Distance (km)"
 MATCH_SCORE_COL = "Match Score"
 _MAX_LOG_REVIEW_COUNT = float(np.log1p(
     pd.to_numeric(businesses["Reviews Count"], errors="coerce").fillna(0).clip(lower=0).max()
 ))
+
+
+def _workplace_match_series(data, category_filters, industry_filters, ranking_context):
+    """'Same workplace' / 'Related workplace' for every row.
+
+    Manual search (no live AI search): everything is 'Same workplace'.
+    AI search: only rows in the AI's direct categories are 'Same workplace'; everything else is
+    'Related workplace'. If the user has since changed the category/industry filters by hand, the
+    AI context is stale and the search counts as manual."""
+    context = ranking_context if isinstance(ranking_context, dict) else {}
+    selected_categories = {str(v).strip() for v in (category_filters or []) if str(v).strip()}
+    selected_industries = {str(v).strip() for v in (industry_filters or []) if str(v).strip()}
+    live_ai = bool(context) and (
+        selected_categories == set(context.get("category_filters") or [])
+        and selected_industries == set(context.get("industry_filters") or [])
+        and (selected_categories or selected_industries)
+    )
+    if not live_ai:
+        return pd.Series(SAME_WORKPLACE, index=data.index, dtype=object)
+    direct = {str(v).strip() for v in (context.get("direct_categories") or []) if str(v).strip()}
+    is_direct = data["Category"].astype(str).str.strip().isin(direct)
+    return pd.Series(np.where(is_direct, SAME_WORKPLACE, RELATED_WORKPLACE), index=data.index, dtype=object)
 
 
 def table_columns(with_distance=False, with_match_score=False):
@@ -1354,7 +1441,8 @@ def table_columns(with_distance=False, with_match_score=False):
         cols.insert(2 if with_match_score else 1, DISTANCE_COL)
         cols.insert(cols.index(DISTANCE_COL) + 1, ESTIMATE_COL)
     return [
-        {"name": c, "id": c, "presentation": "markdown" if c == "Website" else "input", "editable": False}
+        {"name": "Workplace match" if c == WORKPLACE_COL else c, "id": c,
+         "presentation": "markdown" if c == "Website" else "input", "editable": False}
         for c in cols
     ] + [{"name": "_row_idx", "id": "_row_idx", "editable": False}]
 
@@ -1467,7 +1555,8 @@ CARTO_API_KEY = os.getenv("CARTO_API_KEY", "")
 CARTO_TILE_URL = f"https://basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}/{{y}}.png?key={CARTO_API_KEY}"
 MAP_MARKER_BASE_SIZE = 9
 MAP_MARKER_HOVER_SIZE = 16
-MAP_MARKER_COLOR = "#4200A8"       # Keystone purple
+MAP_MARKER_COLOR = "#4200A8"       # Keystone purple = Same workplace
+MAP_MARKER_RELATED_COLOR = "#78FFF1"   # Keystone light blue = Related workplace (AI search only)
 MAP_MARKER_FAV_COLOR = "#FF8C00"   # Keystone orange, for favourited businesses
 DEFAULT_MAP_CENTER = {"lat": -37.8136, "lon": 144.9631}  # Melbourne CBD fallback
 
@@ -1635,7 +1724,7 @@ def _map_status_text(shown, total):
     return f"Showing {shown} of {total:,} in this area. Zoom in to see more"
 
 
-def _build_map_figure(map_df, view, origin=None):
+def _build_map_figure(map_df, view, origin=None, workplace_labels=None):
     """Scattermapbox figure of (at most MAP_MAX_BUSINESSES) individual dots: purple, or orange if favourited."""
     center, zoom = view["center"], view["zoom"]
     fig = go.Figure()
@@ -1652,7 +1741,14 @@ def _build_map_figure(map_df, view, origin=None):
             mode="markers",
             marker=dict(
                 size=MAP_MARKER_BASE_SIZE,
-                color=[MAP_MARKER_FAV_COLOR if f else MAP_MARKER_COLOR for f in map_df["_is_fav"]],
+                color=[
+                    MAP_MARKER_FAV_COLOR if f
+                    else (MAP_MARKER_RELATED_COLOR if lbl == RELATED_WORKPLACE else MAP_MARKER_COLOR)
+                    for f, lbl in zip(
+                        map_df["_is_fav"],
+                        workplace_labels if workplace_labels is not None else [SAME_WORKPLACE] * len(map_df),
+                    )
+                ],
                 opacity=0.9,
             ),
             text=map_df["Business Name"],
@@ -1896,6 +1992,10 @@ dashboard_layout = html.Div(
                                     AI_EXAMPLES + " Please don't type a participant's name or personal details.",
                                     style={"display": "block", "color": "#6F5A8C", "marginTop": "4px", "paddingLeft": "23px"},
                                 ),
+                                html.Small(
+                                    "Search logic and recommendations may not accurately consider accessibility and sensitivity requirements, as many businesses on Google do not have accurate information listed.",
+                                    style={"display": "block", "color": "#6F5A8C", "marginTop": "4px", "marginBottom": "12px", "paddingLeft": "23px"},
+                                ),
                                 dcc.Loading(type="dot", color="#4200A8", children=html.Div(id="ai-status", style={"marginTop": "4px", "minHeight": "0", "paddingLeft": "23px"})),
                             ],
                         ),
@@ -1999,6 +2099,10 @@ dashboard_layout = html.Div(
                                 ),
                             ],
                         ),
+                        html.P(
+                            "This database automatically ranks workplaces higher with shorter commutes and more comprehensive contact information when displaying search results below",
+                            style={"color": "#6F5A8C", "margin": "8px 0 0 0", "paddingLeft": "38px"},
+                        ),
                         html.Div(id="result-count", style={"color": "#6F5A8C", "marginBottom": "15px", "marginTop": "10px", "paddingLeft": "38px"}),
 
                         html.Div(
@@ -2027,8 +2131,15 @@ dashboard_layout = html.Div(
                                     },
                                     style_cell_conditional=[
                                         {"if": {"column_id": "Website"}, "minWidth": "140px", "maxWidth": "160px", "width": "150px"},
+                                        {"if": {"column_id": WORKPLACE_COL}, "minWidth": "180px", "width": "180px"},
                                     ],
-                                    style_data_conditional=[{"if": {"row_index": "odd"}, "backgroundColor": "#F8F5FF"}],
+                                    style_data_conditional=[
+                                        {"if": {"row_index": "odd"}, "backgroundColor": "#F8F5FF"},
+                                        {"if": {"column_id": WORKPLACE_COL, "filter_query": '{Workplace} contains "Same workplace"'},
+                                         "color": SAME_COLOR, "fontWeight": "bold"},
+                                        {"if": {"column_id": WORKPLACE_COL, "filter_query": '{Workplace} contains "Related workplace"'},
+                                         "color": RELATED_TEXT, "fontWeight": "bold"},
+                                    ],
                                 ),
                             ],
                         ),
@@ -2061,6 +2172,15 @@ dashboard_layout = html.Div(
                                                     style=MAP_PILL_STYLE,
                                                 ),
                                                 html.Button("Search this area", id="map-search-area-btn", n_clicks=0, style=MAP_BTN_STYLE_HIDDEN),
+                                            ],
+                                        ),
+                                        # Bottom-left: colour key
+                                        html.Div(
+                                            style={**MAP_PILL_STYLE, "position": "absolute", "bottom": "16px", "left": "14px",
+                                                   "zIndex": 5, "display": "flex", "flexDirection": "column", "gap": "4px", "fontSize": "13px"},
+                                            children=[
+                                                html.Div([html.Span("●", style={"color": SAME_COLOR, "marginRight": "6px"}), SAME_WORKPLACE]),
+                                                html.Div([html.Span("●", style={"color": RELATED_COLOR, "marginRight": "6px"}), RELATED_WORKPLACE]),
                                             ],
                                         ),
                                         # Bottom-centre: how many are showing
@@ -2480,7 +2600,8 @@ def update_table_server_side(page_current, page_size, sort_by, search, industry,
     acc_mask = masks["search"] & masks["industry"] & masks["category"] & masks["council_area"] & masks["suburb"] & masks["review_count"] & masks["favourites"] & masks["proximity"]
     rev_mask = masks["search"] & masks["industry"] & masks["category"] & masks["council_area"] & masks["suburb"] & masks["accessibility"] & masks["favourites"] & masks["proximity"]
 
-    display_data = page_slice[TABLE_COLS].copy()
+    display_data = page_slice[[c for c in TABLE_COLS if c != WORKPLACE_COL]].copy()
+    display_data.insert(1, WORKPLACE_COL, "● " + _workplace_match_series(page_slice, category, industry, ranking_context))
     display_data["_row_idx"] = page_slice.index
     if distances is not None:
         display_data.insert(1, DISTANCE_COL, distances.loc[page_slice.index].round(1))
@@ -2657,10 +2778,11 @@ def toggle_view_mode(_table_clicks, _map_clicks):
     Input("proximity-store", "data"),
     Input("map-auto-search", "value"),
     Input("map-search-area-btn", "n_clicks"),
+    Input("ranking-context", "data"),
     State("map-view-store", "data"),
 )
 def update_map_figure(search, industry, category, council_area, suburb, accessibility, review_count,
-                      fav_only, _trig, _edit, relayout, proximity, auto_value, _search_clicks, last_view):
+                      fav_only, _trig, _edit, relayout, proximity, auto_value, _search_clicks, ranking_context, last_view):
     """Airbnb-style map search: every time the view or a filter changes, re-query the businesses
     inside the visible area and draw only the best MAP_MAX_BUSINESSES of them."""
     trig = ctx.triggered_id
@@ -2701,7 +2823,9 @@ def update_map_figure(search, industry, category, council_area, suburb, accessib
 
     # ── 3. Pick the (at most 50) businesses to show inside that view ──
     pos, total = _pick_map_businesses(mask, view["bounds"])
-    fig = _build_map_figure(businesses.iloc[pos], view, origin=origin)
+    shown = businesses.iloc[pos]
+    labels = _workplace_match_series(shown, category, industry, ranking_context).tolist()
+    fig = _build_map_figure(shown, view, origin=origin, workplace_labels=labels)
     return fig, view, _map_status_text(len(pos), total), btn_style
 
 
@@ -3192,4 +3316,4 @@ def manage_comments(add_clicks, delete_clicks_list, current_idx, text):
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=8056, debug=False)
+    app.run(host="127.0.0.1", port=8059, debug=False)
